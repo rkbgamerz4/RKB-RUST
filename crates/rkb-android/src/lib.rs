@@ -39,11 +39,7 @@ fn log(priority: i32, message: &str) {
         text.push(0);
         // SAFETY: `text` and the static tag are NUL-terminated and live for the call.
         unsafe {
-            __android_log_write(
-                priority,
-                b"RKB-RUST\0".as_ptr().cast(),
-                text.as_ptr().cast(),
-            );
+            __android_log_write(priority, c"RKB-RUST".as_ptr(), text.as_ptr().cast());
         }
     }
 

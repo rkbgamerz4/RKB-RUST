@@ -437,7 +437,7 @@ impl Rect {
     }
 
     #[must_use]
-    pub const fn max(self) -> Vec2 {
+    pub fn max(self) -> Vec2 {
         Vec2::new(self.x + self.width, self.y + self.height)
     }
 
