@@ -29,7 +29,7 @@ rkb-input = { path = "crates/rkb-input" }
 rkb-resource = { path = "crates/rkb-resource" }
 rkb-runtime = { path = "crates/rkb-runtime" }
 rkb-sandbox = { path = "crates/rkb-sandbox" }
-jni = { version = "0.21.1", default-features = false }
+jni = { version = "0.22.4", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
