@@ -274,6 +274,9 @@ class MainActivity : Activity() {
                             target.copyPixelsFromBuffer(buffer)
                             canvas.drawBitmap(target, 0f, 0f, null)
                             frameCount++
+                            if (frameCount == 1L) {
+                                Log.i(TAG, "first frame presented (${width}x$height)")
+                            }
                             if (frameCount % 300L == 0L) {
                                 Log.i(TAG, RkbNative.nativeStats(engineHandle))
                             }
