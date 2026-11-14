@@ -1,0 +1,18 @@
+[package]
+name = "rkb-runtime"
+description = "Fixed-step game runtime joining lifecycle, input, rendering, and presentation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rkb-core.workspace = true
+rkb-input.workspace = true
+rkb-platform.workspace = true
+rkb-render.workspace = true
+
+[lints]
+workspace = true

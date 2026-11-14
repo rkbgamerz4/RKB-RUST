@@ -1,0 +1,23 @@
+[package]
+name = "rkb-demo"
+description = "Headless command-line demo for RKB RUST"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rkb-demo"
+path = "src/main.rs"
+
+[dependencies]
+rkb-core.workspace = true
+rkb-platform.workspace = true
+rkb-runtime.workspace = true
+rkb-sandbox.workspace = true
+rkb-render.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "rkb-android"
+description = "JNI bridge and Android ARM64 native library for RKB RUST"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "rkb_android"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rkb-core.workspace = true
+rkb-input.workspace = true
+rkb-platform.workspace = true
+rkb-render.workspace = true
+rkb-runtime.workspace = true
+rkb-sandbox.workspace = true
+jni.workspace = true
+
+[lints]
+workspace = true

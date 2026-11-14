@@ -1,0 +1,16 @@
+# RKB RUST engine configuration
+app_name = RKB RUST
+
+[graphics]
+target_fps = 60
+vsync = true
+
+[simulation]
+fixed_hz = 60
+max_delta_ms = 250
+
+[input]
+touch_scale = 1.0
+
+[logging]
+level = info

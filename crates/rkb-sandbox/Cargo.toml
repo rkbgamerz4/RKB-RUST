@@ -1,0 +1,22 @@
+[package]
+name = "rkb-sandbox"
+description = "Interactive touch sandbox shared by the CLI demo and Android app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rkb-core.workspace = true
+rkb-input.workspace = true
+rkb-render.workspace = true
+rkb-resource.workspace = true
+rkb-runtime.workspace = true
+
+[dev-dependencies]
+rkb-platform.workspace = true
+
+[lints]
+workspace = true

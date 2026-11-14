@@ -1,0 +1,14 @@
+/target
+/artifacts
+/android/.gradle
+/android/.kotlin
+/android/local.properties
+/android/app/build
+/android/build
+/android/.idea
+*.iml
+*.apk
+*.aab
+*.so
+*.hprof
+.DS_Store

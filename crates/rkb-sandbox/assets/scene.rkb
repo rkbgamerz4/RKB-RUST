@@ -1,0 +1,7 @@
+# RKB RUST sandbox scene
+title = RKB RUST SANDBOX
+clear_color = #101624
+grid = true
+ball_count = 10
+world_margin = 56
+seed = 20261114

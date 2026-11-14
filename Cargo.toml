@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rkb-core",
+    "crates/rkb-platform",
+    "crates/rkb-render",
+    "crates/rkb-input",
+    "crates/rkb-resource",
+    "crates/rkb-runtime",
+    "crates/rkb-sandbox",
+    "crates/rkb-demo",
+    "crates/rkb-pak",
+    "crates/rkb-android",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rkbgamerz4/RKB-RUST"
+authors = ["RKB"]
+
+[workspace.dependencies]
+rkb-core = { path = "crates/rkb-core" }
+rkb-platform = { path = "crates/rkb-platform" }
+rkb-render = { path = "crates/rkb-render" }
+rkb-input = { path = "crates/rkb-input" }
+rkb-resource = { path = "crates/rkb-resource" }
+rkb-runtime = { path = "crates/rkb-runtime" }
+rkb-sandbox = { path = "crates/rkb-sandbox" }
+jni = { version = "0.21.1", default-features = false }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
