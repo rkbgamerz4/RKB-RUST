@@ -52,6 +52,24 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+  msrv:
+    name: MSRV 1.77
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.77
+        run: |
+          rustup toolchain install 1.77.0 --profile minimal
+          rustup default 1.77.0
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+      - name: Run tests
+        run: cargo test --workspace --locked
+
   demo:
     name: Release build and demo artifact
     runs-on: ubuntu-latest

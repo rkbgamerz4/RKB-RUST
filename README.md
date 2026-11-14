@@ -29,7 +29,7 @@ belongs.
 
 ## Quick start (host)
 
-Requirements: stable Rust (the workspace declares Rust 1.75) and Cargo.
+Requirements: stable Rust (MSRV 1.77) and Cargo.
 
 ```bash
 cargo test --workspace
