@@ -80,6 +80,10 @@ impl AndroidEngine {
         let config = RuntimeConfig {
             engine: booted.engine,
             clear_color: rkb_render::Color::rgb(16, 22, 36),
+            // Android copies pixels into a direct buffer; hashing the whole
+            // framebuffer every frame would double memory traffic for no host
+            // benefit.
+            checksum_frames: false,
         };
         let mut runtime = Runtime::new(config, booted.sandbox, width, height);
         runtime.start().map_err(|error| error.to_string())?;
@@ -263,6 +267,42 @@ mod tests {
         let mut pixels = vec![0_u8; 16];
         assert!(matches!(
             engine.frame(&mut pixels, 64, 64, Duration::from_millis(16)),
+            EngineFrame::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn engine_resizes_when_frame_dimensions_change() {
+        let mut engine = AndroidEngine::new(320, 180).unwrap();
+        let mut pixels = vec![0_u8; 640 * 360 * 4];
+        let frame = engine.frame(&mut pixels, 640, 360, Duration::from_millis(16));
+        assert!(matches!(frame, EngineFrame::Presented(_)));
+        let mut again = vec![0_u8; 640 * 360 * 4];
+        assert!(matches!(
+            engine.frame(&mut again, 640, 360, Duration::from_millis(16)),
+            EngineFrame::Presented(_)
+        ));
+    }
+
+    #[test]
+    fn engine_accepts_oversized_direct_buffers() {
+        let mut engine = AndroidEngine::new(32, 16).unwrap();
+        let mut pixels = vec![0_u8; 32 * 16 * 4 + 64];
+        assert!(matches!(
+            engine.frame(&mut pixels, 32, 16, Duration::from_millis(16)),
+            EngineFrame::Presented(_)
+        ));
+        assert!(pixels[..32 * 16 * 4].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn engine_destroy_is_idempotent() {
+        let mut engine = AndroidEngine::new(16, 16).unwrap();
+        engine.destroy();
+        engine.destroy();
+        let mut pixels = vec![0_u8; 16 * 16 * 4];
+        assert!(matches!(
+            engine.frame(&mut pixels, 16, 16, Duration::from_millis(16)),
             EngineFrame::Failed(_)
         ));
     }

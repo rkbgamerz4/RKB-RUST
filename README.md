@@ -14,13 +14,13 @@ compatibility with Minecraft or any third-party game.
 
 | Area | State |
 | --- | --- |
-| Rust workspace | Building on stable Rust; 90+ unit/integration tests |
+| Rust workspace | Building on stable Rust; 101 unit/integration tests |
 | Renderer | Software RGBA8 rasterizer with primitives, clipping, alpha blending, draw lists, and `Camera2D` |
 | Runtime | Fixed timestep, accumulation and drop accounting, lifecycle FSM, resize handling |
 | Input | Multi-touch state, tap/drag/pinch detectors, virtual joystick, touch button |
 | Resources | Traversal-safe paths, memory/file sources, checksummed `RKBPAK1` archives, LRU cache |
-| Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host, lifecycle and touch wiring |
-| CI | Format, clippy, tests, release build, demo artifact, NDK ARM64 build, APK artifact |
+| Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host, landscape sandbox, lifecycle and touch wiring |
+| CI | Format, clippy, tests, release build, demo artifact, NDK ARM64 build, APK and ABI verification |
 
 The software renderer is intentional. It keeps the core testable on any host and
 gives Android a working end-to-end path without requiring GPU drivers in CI. The
@@ -73,7 +73,42 @@ cd android
 `android/app/src/main/jniLibs/arm64-v8a/`. The APK targets `arm64-v8a` only.
 
 CI performs the same NDK cross-compile and Gradle build on Ubuntu and uploads
-both the native library and the debug APK.
+both the native library and the debug APK. The workflow also inspects the APK
+before upload and fails if `lib/arm64-v8a/librkb_android.so` is missing, if
+another ABI is present, or if the package, minimum SDK, target SDK, or
+launchable activity does not match the expected values.
+
+### Android host behavior
+
+- The product is landscape-only (`sensorLandscape`). `Runtime::resize` rebuilds
+  the framebuffer and cancels active touches, markers, and gesture detectors so
+  a rotation cannot drag stale coordinates into the new layout.
+- The `SurfaceView` requests `PixelFormat.RGBA_8888`; frames are copied from the
+  Rust RGBA8 buffer into an `ARGB_8888` bitmap on the render thread.
+- The render thread's frame clock resets on resume and surface recreation, so
+  the first frame after a pause does not inherit a long delta.
+- A missing or ABI-mismatched native library shows an error screen instead of
+  crashing during activity startup.
+- Touch samples are queued on the UI thread and drained on the render thread;
+  the queue is bounded and cleared when rendering stops.
+
+### Measured host performance
+
+These are headless CLI measurements on the development host (Termux, Android
+`aarch64`, 8 logical CPUs), not phone FPS. The demo runs 600 frames in release
+mode:
+
+| Render size | Full frame checksums | Present-only (`--no-checksum`) |
+| --- | --- | --- |
+| 1280x720 | ~16.7 ms/frame | ~4.9 ms/frame |
+| 960x540 | ~8.9 ms/frame | ~2.5 ms/frame |
+
+The difference is the cost of hashing the entire RGBA frame twice (runtime
+checksum plus the headless surface). Android disables the runtime checksum and
+still pays one direct-buffer copy plus one bitmap copy per frame, so device
+timing must be measured on hardware. No physical device was available during
+this phase; installation, launch, touch, rotation, and background/foreground
+behavior remain manual checks.
 
 ## Controls in the sandbox
 
@@ -140,6 +175,9 @@ the Android NDK cross-compile, Gradle APK build, and artifact uploads.
   one render thread.
 - The renderer is software-only today. Performance is adequate for the sandbox,
   not for large 3D scenes.
+- Android installation, launch, touch, rotation, and background/foreground
+  behavior have not yet been validated on a physical device; CI performs the
+  ARM64 build, APK packaging, manifest, and JNI contract checks.
 - The project is early-stage; APIs may change before `1.0`.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`SECURITY.md`](SECURITY.md).

@@ -88,8 +88,13 @@ preserved and the queue is bounded.
 Owns `EngineConfig`, `Lifecycle`, `TouchState`, `Framebuffer`, and the active
 `Game`. `Runtime::frame` clamps delta time, drains lifecycle events, forwards
 touch events, runs zero or more fixed update steps, calls `render`, executes the
-draw list, and presents. It also handles viewport resize without resetting
-unrelated game state.
+draw list, and presents. The draw list is allocated once and reused, and
+per-frame framebuffer hashing is optional (`RuntimeConfig::checksum_frames`) so
+present-only hosts such as Android avoid scanning every pixel.
+
+A viewport resize reallocates the framebuffer and cancels all active touches
+before notifying the game. Touch coordinates are surface-relative, so keeping
+pointers across a resize or rotation would deliver stale positions.
 
 ### `rkb-sandbox`
 
@@ -111,10 +116,17 @@ It is used by both the demo and Android.
   touch, pause, resume, stats, version.
 
 Kotlin `MainActivity` owns a single render thread, a direct `ByteBuffer`, an
-`ARGB_8888` bitmap, and a `SurfaceView`. It creates the engine on the first
-frame, forwards lifecycle callbacks (after stopping the render thread), queues
-touch samples for the render thread, and copies the presented frame into the
-bitmap.
+`ARGB_8888` bitmap, and a `SurfaceView`. It requests `RGBA_8888` surface format,
+creates the engine on the first frame, forwards lifecycle callbacks (after
+stopping the render thread), queues touch samples for the render thread, and
+copies the presented frame into the bitmap. The frame clock resets on every
+thread start, and `surfaceDestroyed` releases the bitmap and direct buffer only
+after the render thread has joined. A failed `System.loadLibrary` is captured
+and rendered as an error screen rather than aborting the process.
+
+`crates/rkb-android/tests/jni_contract.rs` compares every Kotlin `external fun`
+name, parameter type, and return type against the Rust JNI exports, so contract
+drift fails on a normal host instead of at runtime on a device.
 
 ## Timing
 
@@ -148,5 +160,7 @@ this with `Choreographer`/vsync.
 
 - Host CI: fmt, clippy (`-D warnings`), tests, release build, demo artifact.
 - Android CI: install NDK, cross-compile `aarch64-linux-android`, copy the `.so`
-  into `jniLibs`, build the debug APK with Gradle, upload both artifacts.
+  into `jniLibs`, build the debug APK with Gradle, verify the packaged
+  `lib/arm64-v8a/librkb_android.so`, inspect manifest badging, and upload the
+  APK plus a verification report.
 - All workflows use read-only `contents` permissions and pinned action commits.

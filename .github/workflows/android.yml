@@ -78,6 +78,44 @@ jobs:
       - name: Build debug APK
         working-directory: android
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+      - name: Verify APK contents, manifest, and ABI
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          test -f "$APK"
+          unzip -Z1 "$APK" > apk-contents.txt
+          grep -q '^lib/arm64-v8a/librkb_android\.so$' apk-contents.txt
+          OTHER_ABIS="$(grep '^lib/' apk-contents.txt | grep -v '^lib/arm64-v8a/' || true)"
+          if [ -n "$OTHER_ABIS" ]; then
+            echo "unexpected non-ARM64 native entries:"
+            echo "$OTHER_ABIS"
+            exit 1
+          fi
+          AAPT="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/aapt"
+          "$AAPT" dump badging "$APK" > apk-badging.txt
+          grep -q "package: name='com.rkb.rust'" apk-badging.txt
+          grep -q "sdkVersion:'24'" apk-badging.txt
+          grep -q "targetSdkVersion:'35'" apk-badging.txt
+          grep -q "launchable-activity: name='com.rkb.rust.MainActivity'" apk-badging.txt
+          file android/app/src/main/jniLibs/arm64-v8a/librkb_android.so > native-file.txt
+          grep -q 'ARM aarch64' native-file.txt
+          {
+            echo '### APK verification'
+            echo '```'
+            grep -E "package:|sdkVersion:|targetSdkVersion:|launchable-activity:" apk-badging.txt
+            grep '^lib/arm64-v8a/librkb_android\.so$' apk-contents.txt
+            cat native-file.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload APK verification report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rkb-apk-verification
+          path: |
+            apk-contents.txt
+            apk-badging.txt
+            native-file.txt
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload debug APK
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

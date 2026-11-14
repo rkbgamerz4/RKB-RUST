@@ -170,7 +170,9 @@ pub extern "system" fn Java_com_rkb_rust_RkbNative_nativeRenderFrame(
     let delta = Duration::from_nanos(u64::try_from(delta_nanos.max(0)).unwrap_or(0));
     match engine.frame(pixels, width, height, delta) {
         EngineFrame::Presented(_) => JNI_TRUE,
-        EngineFrame::Skipped => JNI_TRUE,
+        // Nothing new was rendered (paused or not started). Report false so
+        // the host does not present a stale buffer.
+        EngineFrame::Skipped => JNI_FALSE,
         EngineFrame::Failed(error) => {
             log(LOG_ERROR, &error);
             JNI_FALSE

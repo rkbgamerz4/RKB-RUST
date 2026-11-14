@@ -2,9 +2,11 @@ package com.rkb.rust
 
 import android.app.Activity
 import android.graphics.Bitmap
+import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -12,6 +14,7 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.widget.TextView
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -23,7 +26,10 @@ import java.util.concurrent.ConcurrentLinkedQueue
  * copies that buffer into an ARGB_8888 bitmap and presents it on a SurfaceView.
  */
 class MainActivity : Activity() {
-    private lateinit var view: RkbView
+    private var view: RkbView? = null
+
+    @Volatile
+    private var activityResumed = false
 
     @Volatile
     private var engineHandle: Long = 0L
@@ -32,22 +38,39 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hideSystemUi()
+        if (!RkbNative.isLoaded) {
+            Log.e(TAG, "native library failed to load", RkbNative.loadError)
+            showStartupError()
+            return
+        }
         Log.i(TAG, "RKB RUST native version ${RkbNative.nativeVersion()}")
-        view = RkbView()
-        setContentView(view)
+        view = RkbView().also { setContentView(it) }
+    }
+
+    private fun showStartupError() {
+        val message = TextView(this).apply {
+            gravity = Gravity.CENTER
+            text = getString(R.string.native_load_error)
+            textSize = 18f
+        }
+        setContentView(message)
     }
 
     override fun onResume() {
         super.onResume()
         hideSystemUi()
+        activityResumed = true
+        val current = view ?: return
         if (engineHandle != 0L) {
             RkbNative.nativeResume(engineHandle)
         }
-        view.startRendering()
+        current.startRendering()
     }
 
     override fun onPause() {
-        val stopped = view.stopRendering()
+        activityResumed = false
+        val current = view
+        val stopped = current?.stopRendering() ?: true
         if (stopped && engineHandle != 0L) {
             RkbNative.nativePause(engineHandle)
         }
@@ -55,7 +78,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        val stopped = view.stopRendering()
+        val stopped = view?.stopRendering() ?: true
         if (stopped) {
             if (engineHandle != 0L) {
                 RkbNative.nativeDestroy(engineHandle)
@@ -66,6 +89,7 @@ class MainActivity : Activity() {
             // thread might still be inside a native call.
             Log.w(TAG, "render thread did not stop; leaving native engine allocated")
         }
+        view = null
         super.onDestroy()
     }
 
@@ -105,14 +129,22 @@ class MainActivity : Activity() {
         private var renderThread: Thread? = null
         private var frameBuffer: ByteBuffer? = null
         private var bitmap: Bitmap? = null
+
+        @Volatile
         private var bufferWidth = 0
+
+        @Volatile
         private var bufferHeight = 0
+
+        @Volatile
         private var lastFrameNanos = 0L
+
         private var frameCount = 0L
         private val touchQueue = ConcurrentLinkedQueue<TouchSample>()
 
         init {
             holder.addCallback(this)
+            holder.setFormat(PixelFormat.RGBA_8888)
             keepScreenOn = true
             isFocusable = true
             isFocusableInTouchMode = true
@@ -120,10 +152,14 @@ class MainActivity : Activity() {
 
         override fun surfaceCreated(holder: SurfaceHolder) {
             surfaceReady = true
-            startRendering()
+            if (activityResumed) {
+                startRendering()
+            }
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            // Force the render thread to rebuild its bitmap and direct buffer
+            // for the new surface geometry.
             synchronized(this) {
                 bufferWidth = 0
                 bufferHeight = 0
@@ -132,19 +168,26 @@ class MainActivity : Activity() {
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             surfaceReady = false
-            stopRendering()
+            touchQueue.clear()
+            lastFrameNanos = 0L
+            if (stopRendering()) {
+                releaseBuffers()
+            }
         }
 
         fun startRendering() {
             if (renderThread?.isAlive == true) {
                 return
             }
+            // Do not carry a frame delta across a pause or surface recreation.
+            lastFrameNanos = 0L
             running = true
             renderThread = Thread(this, "RkbRender").also { it.start() }
         }
 
         fun stopRendering(): Boolean {
             running = false
+            touchQueue.clear()
             val thread = renderThread
             if (thread != null && thread !== Thread.currentThread()) {
                 try {
@@ -162,14 +205,27 @@ class MainActivity : Activity() {
             return stopped
         }
 
+        private fun releaseBuffers() {
+            frameBuffer = null
+            bitmap?.recycle()
+            bitmap = null
+            bufferWidth = 0
+            bufferHeight = 0
+        }
+
         override fun run() {
             while (running && surfaceReady) {
                 val frameStart = System.nanoTime()
-                val canvas = holder.lockCanvas() ?: continue
+                val canvas = holder.lockCanvas()
+                if (canvas == null) {
+                    sleepUntilNextFrame(frameStart)
+                    continue
+                }
                 try {
                     val width = canvas.width
                     val height = canvas.height
                     if (width <= 0 || height <= 0) {
+                        sleepUntilNextFrame(frameStart)
                         continue
                     }
                     ensureBuffers(width, height)
@@ -181,7 +237,6 @@ class MainActivity : Activity() {
                             running = false
                             break
                         }
-                        lastFrameNanos = System.nanoTime()
                     }
 
                     // Native calls are confined to this render thread. UI-thread
@@ -190,7 +245,7 @@ class MainActivity : Activity() {
 
                     val now = System.nanoTime()
                     val delta = if (lastFrameNanos == 0L) {
-                        16_666_666L
+                        FRAME_NANOS
                     } else {
                         (now - lastFrameNanos).coerceIn(1_000_000L, 250_000_000L)
                     }
@@ -220,15 +275,18 @@ class MainActivity : Activity() {
                     }
                 }
 
-                val elapsed = System.nanoTime() - frameStart
-                val remaining = FRAME_NANOS - elapsed
-                if (remaining > 0L) {
-                    try {
-                        Thread.sleep(remaining / 1_000_000L, (remaining % 1_000_000L).toInt())
-                    } catch (interrupted: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        running = false
-                    }
+                sleepUntilNextFrame(frameStart)
+            }
+        }
+
+        private fun sleepUntilNextFrame(frameStart: Long) {
+            val remaining = FRAME_NANOS - (System.nanoTime() - frameStart)
+            if (remaining > 0L) {
+                try {
+                    Thread.sleep(remaining / 1_000_000L, (remaining % 1_000_000L).toInt())
+                } catch (interrupted: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    running = false
                 }
             }
         }
@@ -237,8 +295,11 @@ class MainActivity : Activity() {
             if (width == bufferWidth && height == bufferHeight && frameBuffer != null) {
                 return
             }
-            val bytes = width * height * 4
-            frameBuffer = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder())
+            val bytes = width.toLong() * height.toLong() * 4L
+            check(bytes in 4..Int.MAX_VALUE.toLong()) {
+                "invalid surface size ${width}x$height"
+            }
+            frameBuffer = ByteBuffer.allocateDirect(bytes.toInt()).order(ByteOrder.nativeOrder())
             val oldBitmap = bitmap
             bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             oldBitmap?.recycle()

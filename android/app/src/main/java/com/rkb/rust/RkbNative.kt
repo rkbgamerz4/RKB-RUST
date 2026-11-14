@@ -6,10 +6,29 @@ package com.rkb.rust
  * Native state is not synchronized. The activity serializes calls: touch input
  * is queued for the render thread, and lifecycle calls happen only after the
  * render thread has been stopped and joined.
+ *
+ * Library loading is captured instead of thrown from the object initializer so
+ * a missing or ABI-mismatched library produces a readable screen rather than a
+ * process crash. Callers must check [isLoaded] before invoking externals.
  */
 object RkbNative {
+    @Volatile
+    var loadError: Throwable? = null
+        private set
+
+    @Volatile
+    private var loaded = false
+
+    val isLoaded: Boolean
+        get() = loaded
+
     init {
-        System.loadLibrary("rkb_android")
+        try {
+            System.loadLibrary("rkb_android")
+            loaded = true
+        } catch (error: Throwable) {
+            loadError = error
+        }
     }
 
     external fun nativeCreate(width: Int, height: Int): Long
