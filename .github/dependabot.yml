@@ -8,6 +8,11 @@ updates:
     groups:
       rust-dependencies:
         patterns: ["*"]
+    ignore:
+      # jni 0.22 splits JNIEnv into Env/EnvUnowned and needs a manual bridge
+      # migration. Keep 0.21.x until that migration lands.
+      - dependency-name: "jni"
+        versions: [">=0.22.0"]
 
   - package-ecosystem: github-actions
     directory: "/"
@@ -23,3 +28,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    ignore:
+      # AGP 9 needs Gradle 9.6+ and a project migration. Keep the validated
+      # AGP 8.7 / Gradle 8.9 pair until the migration is done.
+      - dependency-name: "com.android.application"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "gradle-wrapper"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "org.jetbrains.kotlin.android"
+        update-types: ["version-update:semver-major"]
