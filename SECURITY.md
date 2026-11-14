@@ -52,7 +52,9 @@ Out of scope:
 ## Known limitations
 
 - JNI handles are raw pointers. Callers must pass valid handles from
-  `nativeCreate` and must not use them after `nativeDestroy`.
+  `nativeCreate` and must not use them after `nativeDestroy`. The Kotlin host
+  serializes lifecycle calls by stopping the render thread and intentionally
+  leaks a handle if that thread cannot be joined in time.
 - Native calls are not thread-safe by design; the Kotlin host confines them to a
   single render thread.
 - The direct `ByteBuffer` capacity is checked, but callers must still provide a

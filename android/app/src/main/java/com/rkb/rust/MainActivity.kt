@@ -47,18 +47,24 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
-        view.stopRendering()
-        if (engineHandle != 0L) {
+        val stopped = view.stopRendering()
+        if (stopped && engineHandle != 0L) {
             RkbNative.nativePause(engineHandle)
         }
         super.onPause()
     }
 
     override fun onDestroy() {
-        view.stopRendering()
-        if (engineHandle != 0L) {
-            RkbNative.nativeDestroy(engineHandle)
-            engineHandle = 0L
+        val stopped = view.stopRendering()
+        if (stopped) {
+            if (engineHandle != 0L) {
+                RkbNative.nativeDestroy(engineHandle)
+                engineHandle = 0L
+            }
+        } else {
+            // Leaking the handle is safer than freeing it while the render
+            // thread might still be inside a native call.
+            Log.w(TAG, "render thread did not stop; leaving native engine allocated")
         }
         super.onDestroy()
     }
@@ -137,16 +143,23 @@ class MainActivity : Activity() {
             renderThread = Thread(this, "RkbRender").also { it.start() }
         }
 
-        fun stopRendering() {
+        fun stopRendering(): Boolean {
             running = false
-            renderThread?.let { thread ->
+            val thread = renderThread
+            if (thread != null && thread !== Thread.currentThread()) {
                 try {
                     thread.join(1000)
                 } catch (interrupted: InterruptedException) {
                     Thread.currentThread().interrupt()
                 }
             }
-            renderThread = null
+            val stopped = thread == null || !thread.isAlive
+            if (stopped) {
+                renderThread = null
+            } else {
+                Log.w(TAG, "render thread did not stop within 1s")
+            }
+            return stopped
         }
 
         override fun run() {

@@ -3,7 +3,9 @@ package com.rkb.rust
 /**
  * JNI surface implemented by `crates/rkb-android`.
  *
- * All methods must be called from the render thread, except nativeVersion.
+ * Native state is not synchronized. The activity serializes calls: touch input
+ * is queued for the render thread, and lifecycle calls happen only after the
+ * render thread has been stopped and joined.
  */
 object RkbNative {
     init {

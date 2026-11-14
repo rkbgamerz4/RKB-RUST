@@ -137,7 +137,9 @@ this with `Choreographer`/vsync.
 - The Rust side is not internally synchronized. JNI calls must be confined to the
   Kotlin render thread.
 - `nativeCreate` returns an opaque `jlong` pointer; `nativeDestroy` consumes it
-  exactly once and zeroes the Kotlin field.
+  exactly once and zeroes the Kotlin field. Pause and destroy first stop and
+  join the render thread; if that join times out, the host skips the native call
+  (and may intentionally leak the handle) rather than risk use-after-free.
 - `present` writes only into the Kotlin-owned direct buffer for the duration of
   the call.
 - No global mutable state is used by the runtime.

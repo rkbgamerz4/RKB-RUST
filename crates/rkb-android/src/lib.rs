@@ -5,8 +5,9 @@
 //!
 //! # Threading
 //!
-//! Every native function must be called from the same UI/render thread. The
-//! Kotlin wrapper guarantees this with a single render thread. Handles are
+//! Native state is not internally synchronized. Calls must be serialized by the
+//! host: the Kotlin wrapper queues touch input for its single render thread and
+//! stops/joins that thread before pause, resume, or destroy. Handles are
 //! heap-allocated [`AndroidEngine`] pointers and must be destroyed exactly once.
 
 #![allow(clippy::missing_safety_doc)]
