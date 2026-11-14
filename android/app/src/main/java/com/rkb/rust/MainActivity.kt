@@ -37,21 +37,28 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        hideSystemUi()
-        if (!RkbNative.isLoaded) {
-            Log.e(TAG, "native library failed to load", RkbNative.loadError)
-            showStartupError()
-            return
+        try {
+            if (!RkbNative.isLoaded) {
+                Log.e(TAG, "native library failed to load", RkbNative.loadError)
+                showStartupError(getString(R.string.native_load_error))
+                return
+            }
+            Log.i(TAG, "RKB RUST native version ${RkbNative.nativeVersion()}")
+            view = RkbView().also { setContentView(it) }
+        } catch (error: Throwable) {
+            Log.e(TAG, "startup failed", error)
+            showStartupError(error.message ?: error.javaClass.simpleName)
+        } finally {
+            hideSystemUi()
         }
-        Log.i(TAG, "RKB RUST native version ${RkbNative.nativeVersion()}")
-        view = RkbView().also { setContentView(it) }
     }
 
-    private fun showStartupError() {
+    private fun showStartupError(detail: String) {
         val message = TextView(this).apply {
             gravity = Gravity.CENTER
-            text = getString(R.string.native_load_error)
-            textSize = 18f
+            text = getString(R.string.startup_error, detail)
+            textSize = 16f
+            setPadding(48, 48, 48, 48)
         }
         setContentView(message)
     }
@@ -101,21 +108,29 @@ class MainActivity : Activity() {
     }
 
     private fun hideSystemUi() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.insetsController?.let { controller ->
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                // PhoneWindow.getInsetsController() dereferences the decor
+                // view, which does not exist until the content view has been
+                // installed. Go through the (nullable) view controller instead
+                // of calling window.insetsController during startup.
+                val controller = window.decorView.windowInsetsController ?: return
                 controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
                 controller.systemBarsBehavior =
                     WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            } else {
+                @Suppress("DEPRECATION")
+                window.decorView.systemUiVisibility =
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
             }
-        } else {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility =
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
-                View.SYSTEM_UI_FLAG_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        } catch (error: RuntimeException) {
+            // Immersive mode is cosmetic; never let it abort startup.
+            Log.w(TAG, "could not hide system UI", error)
         }
     }
 

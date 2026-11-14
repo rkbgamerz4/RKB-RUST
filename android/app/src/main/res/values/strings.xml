@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">RKB RUST</string>
-    <string name="native_load_error">RKB RUST could not load the ARM64 native library.\n\nThis build requires a 64-bit ARM Android device.</string>
+    <string name="native_load_error">The ARM64 native library could not be loaded. This build requires a 64-bit ARM Android device.</string>
+    <string name="startup_error">RKB RUST failed to start.\n\n%1$s</string>
 </resources>
