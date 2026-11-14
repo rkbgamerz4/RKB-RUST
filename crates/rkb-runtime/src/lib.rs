@@ -37,6 +37,12 @@ pub trait Game {
 pub struct RuntimeConfig {
     pub engine: EngineConfig,
     pub clear_color: Color,
+    /// Hash every presented frame.
+    ///
+    /// Deterministic consumers (tests, the CLI demo, visual regression) keep
+    /// this enabled. Hosts that only present pixels, such as Android, disable
+    /// it to avoid scanning the whole framebuffer every frame.
+    pub checksum_frames: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -44,6 +50,7 @@ impl Default for RuntimeConfig {
         Self {
             engine: EngineConfig::default(),
             clear_color: Color::rgb(14, 18, 28),
+            checksum_frames: true,
         }
     }
 }
@@ -100,6 +107,7 @@ pub struct Runtime<G: Game> {
     game: G,
     timestep: rkb_core::FixedTimestep,
     backend: SoftwareBackend,
+    draw_list: DrawList,
     touches: TouchState,
     rate: rkb_core::RateCounter,
     frame_index: u64,
@@ -116,6 +124,7 @@ impl<G: Game> Runtime<G> {
         let height = height.max(1);
         let timestep = rkb_core::FixedTimestep::from_hz(config.engine.fixed_hz, 8);
         let viewport = Vec2::new(width as f32, height as f32);
+        let clear_color = config.clear_color;
         let mut game = game;
         game.on_resize(viewport);
         Self {
@@ -124,6 +133,7 @@ impl<G: Game> Runtime<G> {
             game,
             timestep,
             backend: SoftwareBackend::new(width, height),
+            draw_list: DrawList::new(clear_color),
             touches: TouchState::new(),
             rate: rkb_core::RateCounter::new(),
             frame_index: 0,
@@ -223,6 +233,10 @@ impl<G: Game> Runtime<G> {
         let height = height.max(1);
         self.viewport = Vec2::new(width as f32, height as f32);
         self.backend.resize(width, height);
+        // Pointer coordinates are surface-relative, so a resize or rotation
+        // invalidates every active touch. Drop them instead of delivering
+        // stale positions to the game.
+        self.touches.cancel_all();
         self.game.on_resize(self.viewport);
     }
 
@@ -254,9 +268,10 @@ impl<G: Game> Runtime<G> {
             });
         }
 
-        let mut list = DrawList::new(self.config.clear_color);
-        self.game.render(&mut list, self.viewport);
-        let render = self.backend.render(&list)?;
+        self.draw_list.set_clear_color(self.config.clear_color);
+        self.draw_list.clear_commands();
+        self.game.render(&mut self.draw_list, self.viewport);
+        let render = self.backend.render(&self.draw_list)?;
         let framebuffer = self.backend.framebuffer();
         surface.present(framebuffer.pixels())?;
 
@@ -273,7 +288,11 @@ impl<G: Game> Runtime<G> {
             fps: self.rate.fps(),
             elapsed: self.elapsed_time,
             render,
-            checksum: framebuffer.checksum(),
+            checksum: if self.config.checksum_frames {
+                framebuffer.checksum()
+            } else {
+                0
+            },
         };
         Ok(self.last_report)
     }
@@ -284,11 +303,16 @@ impl<G: Game> Runtime<G> {
             self.last_report.ran = false;
             return Ok(self.last_report);
         }
-        let mut list = DrawList::new(self.config.clear_color);
-        self.game.render(&mut list, self.viewport);
-        let render = self.backend.render(&list)?;
+        self.draw_list.set_clear_color(self.config.clear_color);
+        self.draw_list.clear_commands();
+        self.game.render(&mut self.draw_list, self.viewport);
+        let render = self.backend.render(&self.draw_list)?;
         self.last_report.render = render;
-        self.last_report.checksum = self.backend.framebuffer().checksum();
+        self.last_report.checksum = if self.config.checksum_frames {
+            self.backend.framebuffer().checksum()
+        } else {
+            0
+        };
         self.last_report.ran = true;
         self.last_report.frame_index = self.frame_index;
         Ok(self.last_report)
@@ -306,12 +330,19 @@ mod tests {
         updates: u32,
         renders: u32,
         touches: u32,
+        resizes: u32,
         last_dt: f32,
+        last_viewport: Vec2,
     }
 
     impl Game for TestGame {
         fn on_touch(&mut self, _event: TouchEvent) {
             self.touches += 1;
+        }
+
+        fn on_resize(&mut self, viewport: Vec2) {
+            self.resizes += 1;
+            self.last_viewport = viewport;
         }
 
         fn update(&mut self, context: UpdateContext) {
@@ -402,6 +433,56 @@ mod tests {
         assert_eq!(runtime.viewport(), Vec2::new(100.0, 50.0));
         assert_eq!(runtime.framebuffer().width(), 100);
         assert_eq!(runtime.framebuffer().height(), 50);
+    }
+
+    #[test]
+    fn resize_cancels_active_touches_and_notifies_game() {
+        let mut runtime = runtime();
+        runtime.start().unwrap();
+        runtime.touch(TouchEvent::started(TouchPoint::new(7, Vec2::new(4.0, 4.0))));
+        runtime.touch(TouchEvent::started(TouchPoint::new(8, Vec2::new(5.0, 5.0))));
+        assert_eq!(runtime.touches().len(), 2);
+
+        runtime.resize(64, 48);
+        assert!(runtime.touches().is_empty());
+        assert_eq!(runtime.viewport(), Vec2::new(64.0, 48.0));
+        assert_eq!(runtime.game().last_viewport, Vec2::new(64.0, 48.0));
+        // One notification during construction, one for the resize.
+        assert_eq!(runtime.game().resizes, 2);
+    }
+
+    #[test]
+    fn frame_checksums_can_be_disabled_for_present_only_hosts() {
+        let config = RuntimeConfig {
+            checksum_frames: false,
+            ..RuntimeConfig::default()
+        };
+        let mut runtime = Runtime::new(config, TestGame::default(), 16, 16);
+        runtime.start().unwrap();
+        let mut surface = HeadlessSurface::new(16, 16);
+        let report = runtime
+            .frame(Duration::from_millis(16), &mut surface)
+            .unwrap();
+        assert!(report.ran);
+        assert_eq!(report.checksum, 0);
+        assert_ne!(surface.last_checksum(), 0);
+    }
+
+    #[test]
+    fn repeated_frames_reuse_the_draw_list() {
+        let mut runtime = runtime();
+        runtime.start().unwrap();
+        let mut surface = HeadlessSurface::new(32, 32);
+        for _ in 0..32 {
+            let report = runtime
+                .frame(Duration::from_millis(16), &mut surface)
+                .unwrap();
+            assert!(report.ran);
+        }
+        assert_eq!(runtime.game().renders, 32);
+        assert_eq!(surface.frames_presented(), 32);
+        // The reused list holds exactly the commands from the latest frame.
+        assert_eq!(runtime.draw_list.len(), 1);
     }
 
     #[test]

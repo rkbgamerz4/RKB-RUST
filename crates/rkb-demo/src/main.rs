@@ -24,6 +24,7 @@ Options:
   --height N      Framebuffer height in pixels (default: 540)
   --out PATH      Write the final frame as a binary PPM
   --frame-ms N    Frame delta in milliseconds (default: 16.666)
+  --no-checksum   Skip frame hashing (present-only throughput)
   -h, --help      Show this help
 ";
 
@@ -34,6 +35,7 @@ struct Options {
     height: u32,
     out: Option<PathBuf>,
     frame_delta: Duration,
+    checksum_frames: bool,
 }
 
 impl Default for Options {
@@ -44,6 +46,7 @@ impl Default for Options {
             height: 540,
             out: None,
             frame_delta: Duration::from_nanos(16_666_667),
+            checksum_frames: true,
         }
     }
 }
@@ -78,6 +81,7 @@ fn parse_args() -> Result<Option<Options>, String> {
                 }
                 options.frame_delta = Duration::from_secs_f64(millis / 1000.0);
             }
+            "--no-checksum" => options.checksum_frames = false,
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -93,12 +97,16 @@ fn run(options: &Options) -> Result<(), String> {
     let config = RuntimeConfig {
         engine: booted.engine.clone(),
         clear_color: rkb_render::Color::rgb(14, 18, 28),
+        checksum_frames: options.checksum_frames,
     };
 
     let mut runtime = Runtime::new(config, booted.sandbox, options.width, options.height);
     runtime.start().map_err(|error| error.to_string())?;
 
     let mut surface = HeadlessSurface::new(options.width, options.height);
+    if !options.checksum_frames {
+        surface = surface.without_hashing();
+    }
     let mut last_report = None;
     for _ in 0..options.frames {
         let report = runtime

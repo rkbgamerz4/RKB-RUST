@@ -97,6 +97,7 @@ pub struct HeadlessSurface {
     height: u32,
     frames_presented: u64,
     last_checksum: u64,
+    hash_frames: bool,
 }
 
 impl HeadlessSurface {
@@ -107,7 +108,15 @@ impl HeadlessSurface {
             height,
             frames_presented: 0,
             last_checksum: 0,
+            hash_frames: true,
         }
+    }
+
+    /// Skips the per-frame checksum, matching hosts that only present pixels.
+    #[must_use]
+    pub const fn without_hashing(mut self) -> Self {
+        self.hash_frames = false;
+        self
     }
 
     #[must_use]
@@ -134,12 +143,14 @@ impl Surface for HeadlessSurface {
                 rgba.len()
             )));
         }
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in rgba {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        if self.hash_frames {
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            for byte in rgba {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            self.last_checksum = hash;
         }
-        self.last_checksum = hash;
         self.frames_presented += 1;
         Ok(())
     }
@@ -204,6 +215,14 @@ mod tests {
     fn headless_surface_rejects_wrong_frame_size() {
         let mut surface = HeadlessSurface::new(2, 2);
         assert!(surface.present(&[0_u8; 15]).is_err());
+    }
+
+    #[test]
+    fn headless_surface_can_skip_hashing() {
+        let mut surface = HeadlessSurface::new(2, 2).without_hashing();
+        surface.present(&[7_u8; 16]).unwrap();
+        assert_eq!(surface.frames_presented(), 1);
+        assert_eq!(surface.last_checksum(), 0);
     }
 
     #[test]

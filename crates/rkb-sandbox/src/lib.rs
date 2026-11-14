@@ -260,6 +260,15 @@ impl Sandbox {
 
     fn layout(&mut self, viewport: Vec2) {
         self.viewport = Vec2::new(viewport.x.max(1.0), viewport.y.max(1.0));
+        // Touch coordinates are relative to the old surface. A resize (for
+        // example, rotation) invalidates every active pointer and gesture, so
+        // start from a clean interaction state instead of dragging stale
+        // positions into the new layout.
+        self.touches.cancel_all();
+        self.markers.clear();
+        self.taps = TapDetector::default();
+        self.drag = DragDetector::default();
+        self.pinch.reset();
         self.camera.set_viewport(self.viewport.x, self.viewport.y);
         let scale = (self.viewport.y / 720.0).clamp(0.7, 1.5);
         let radius = 72.0 * scale;
@@ -792,6 +801,33 @@ mod tests {
     }
 
     #[test]
+    fn resize_cancels_touches_and_gesture_state() {
+        let mut booted = boot();
+        let center = booted.sandbox.joystick.center();
+        booted
+            .sandbox
+            .handle_touch(touch(TouchPhase::Started, 1, center.x, center.y, 0));
+        booted
+            .sandbox
+            .handle_touch(touch(TouchPhase::Started, 2, 500.0, 300.0, 0));
+
+        assert_eq!(booted.sandbox.touches.len(), 2);
+        assert_eq!(booted.sandbox.markers.len(), 2);
+        assert!(booted.sandbox.joystick.is_active());
+        assert!(booted.sandbox.pinch.is_active());
+
+        booted.sandbox.on_resize(Vec2::new(720.0, 1280.0));
+
+        assert!(booted.sandbox.touches.is_empty());
+        assert!(booted.sandbox.markers.is_empty());
+        assert!(!booted.sandbox.joystick.is_active());
+        assert!(!booted.sandbox.button.is_pressed());
+        assert!(!booted.sandbox.pinch.is_active());
+        assert!(!booted.sandbox.drag.is_dragging());
+        assert_eq!(booted.sandbox.viewport, Vec2::new(720.0, 1280.0));
+    }
+
+    #[test]
     fn rendering_produces_commands_and_pixels() {
         let mut list = DrawList::new(Color::BLACK);
         let booted = boot();
@@ -810,6 +846,7 @@ mod tests {
             RuntimeConfig {
                 engine: booted.engine.clone(),
                 clear_color: booted.sandbox.scene.clear_color,
+                checksum_frames: true,
             },
             booted.sandbox,
             1280,
