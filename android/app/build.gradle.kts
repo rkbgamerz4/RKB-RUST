@@ -5,6 +5,13 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val requestedAbis = (findProperty("rkb.abis") as String?)
+    ?.split(',')
+    ?.map { it.trim() }
+    ?.filter { it.isNotEmpty() }
+    ?.takeIf { it.isNotEmpty() }
+    ?: listOf("arm64-v8a")
+
 android {
     namespace = "com.rkb.rust"
     compileSdk = 35
@@ -16,7 +23,7 @@ android {
         versionCode = 1
         versionName = "0.1.0"
         ndk {
-            abiFilters += "arm64-v8a"
+            abiFilters += requestedAbis
         }
     }
 

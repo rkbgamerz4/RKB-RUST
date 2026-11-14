@@ -4,7 +4,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API="${RKB_ANDROID_API:-24}"
-TARGET="aarch64-linux-android"
+TARGET="${RKB_TARGET:-aarch64-linux-android}"
+ABI="${RKB_ABI:-arm64-v8a}"
 PROFILE="${RKB_PROFILE:-release}"
 
 find_ndk() {
@@ -35,13 +36,14 @@ case "$(uname -s)" in
     Darwin) HOST_TAG="darwin-x86_64" ;;
 esac
 TOOLCHAIN="${NDK}/toolchains/llvm/prebuilt/${HOST_TAG}/bin"
-LINKER="${TOOLCHAIN}/aarch64-linux-android${API}-clang"
+LINKER="${TOOLCHAIN}/${TARGET}${API}-clang"
 if [[ ! -x "${LINKER}" ]]; then
     echo "error: linker not found at ${LINKER}" >&2
     exit 1
 fi
 
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${LINKER}"
+export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="${LINKER}"
 
 cd "${ROOT}"
 rustup target add "${TARGET}" >/dev/null 2>&1 || true
@@ -53,7 +55,7 @@ else
     BUILT="target/${TARGET}/debug/librkb_android.so"
 fi
 
-DEST="android/app/src/main/jniLibs/arm64-v8a"
+DEST="android/app/src/main/jniLibs/${ABI}"
 mkdir -p "${DEST}"
 cp "${BUILT}" "${DEST}/librkb_android.so"
 "${TOOLCHAIN}/llvm-strip" --strip-unneeded "${DEST}/librkb_android.so" 2>/dev/null || true
