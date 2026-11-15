@@ -135,9 +135,46 @@ assert_common_log() {
     fi
 }
 
+# The host prefers the app's external files dir and falls back to private
+# storage, so a world file may be in either. `run-as` can read private storage
+# but not always /sdcard on newer Android images, while the `shell` user can
+# read /sdcard but not private storage. Probe both contexts.
+world_file_exists() {
+    local name="$1"
+    local path
+    for path in \
+        "/storage/emulated/0/Android/data/${PKG}/files/minecraft/world/${name}" \
+        "/sdcard/Android/data/${PKG}/files/minecraft/world/${name}"; do
+        if adb shell "test -f '${path}'" >/dev/null 2>&1; then
+            log "found ${name}: ${path}"
+            return 0
+        fi
+    done
+    if adb shell "run-as ${PKG} test -f 'files/minecraft/world/${name}'" >/dev/null 2>&1; then
+        log "found ${name}: app-private files/minecraft/world/${name}"
+        return 0
+    fi
+    return 1
+}
+
+dump_world_state() {
+    log "world directory contents (diagnostic)"
+    adb shell ls -la "/storage/emulated/0/Android/data/${PKG}/files/minecraft/world" || true
+    adb shell "run-as ${PKG} ls -la files/minecraft/world" || true
+}
+
 # ---------------------------------------------------------------------------
 # Scenario 1: fresh install with no save -> generated terrain.
 # ---------------------------------------------------------------------------
+
+# `pm clear` wipes private data; also drop any world left on external storage
+# so this is a genuinely empty install.
+adb shell rm -rf "/storage/emulated/0/Android/data/${PKG}/files/minecraft/world" || true
+adb shell "run-as ${PKG} rm -rf files/minecraft/world" || true
+if world_file_exists "level.dat"; then
+    dump_world_state
+    fail "world directory still exists before the fresh-install startup"
+fi
 
 launch_and_wait
 capture_activity "-generated"
@@ -152,19 +189,14 @@ grep -q 'kind=generated' "${GENERATED_LOG}" \
     || fail "fresh install did not start a generated world"
 grep -q 'Generated world seed' "${GENERATED_LOG}" \
     || fail "generated world seed was not reported"
-adb shell "run-as ${PKG} test -f files/minecraft/world/level.dat" \
-    || adb shell "run-as ${PKG} test -f /sdcard/Android/data/${PKG}/files/minecraft/world/level.dat" \
-    || fail "generated world did not persist level.dat"
-SESSION_FOUND=false
-for SESSION_PATH in \
-    "files/minecraft/world/rkb-session.json" \
-    "/sdcard/Android/data/${PKG}/files/minecraft/world/rkb-session.json"; do
-    if adb shell "run-as ${PKG} test -f '${SESSION_PATH}'"; then
-        SESSION_FOUND=true
-        break
-    fi
-done
-[ "${SESSION_FOUND}" = true ] || fail "generated world did not persist rkb-session.json"
+world_file_exists "level.dat" || {
+    dump_world_state
+    fail "generated world did not persist level.dat"
+}
+world_file_exists "rkb-session.json" || {
+    dump_world_state
+    fail "generated world did not persist rkb-session.json"
+}
 
 log "generated-world startup passed"
 stop_app
@@ -181,8 +213,14 @@ rm -rf "${OUT}/fixture-world"
 )
 adb shell rm -rf /data/local/tmp/rkb-fixture-world
 adb push "${OUT}/fixture-world" /data/local/tmp/rkb-fixture-world
-# Remove both world locations so the fixture is unambiguously selected.
-adb shell "run-as ${PKG} sh -c 'rm -rf files/minecraft/world /sdcard/Android/data/${PKG}/files/minecraft/world'"
+# Remove both world locations so the fixture is unambiguously selected. The
+# shell user owns /sdcard, and run-as owns private storage.
+adb shell rm -rf "/storage/emulated/0/Android/data/${PKG}/files/minecraft/world" || true
+adb shell "run-as ${PKG} rm -rf files/minecraft/world" || true
+if world_file_exists "level.dat"; then
+    dump_world_state
+    fail "could not clear the previous world before the supplied-save scenario"
+fi
 adb shell "run-as ${PKG} sh -c 'mkdir -p files/minecraft && cp -r /data/local/tmp/rkb-fixture-world files/minecraft/world'"
 adb shell "run-as ${PKG} test -f files/minecraft/world/level.dat" \
     || fail "fixture save was not copied into app storage"
