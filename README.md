@@ -6,19 +6,22 @@ ARM64**, with a headless CLI demo and a native Android host.
 The project currently ships a deterministic software renderer, fixed-timestep
 runtime, touch/gesture input, a path-safe asset system with a custom `RKBPAK1`
 archive format, and a JNI bridge that presents frames through a Kotlin
-`SurfaceView`. It is a foundation and an interactive sandbox — **not a game
-engine with a full editor, and not a Minecraft client**. It does not claim
-compatibility with Minecraft or any third-party game.
+`SurfaceView`. It is a foundation and an interactive sandbox, **not yet a
+playable Minecraft client**. A separate `rkb-mc` crate now reads Minecraft: Java
+Edition 1.21 saved-world data (NBT, Anvil regions, chunk palettes, block states),
+but it is not yet connected to the Android runtime. The project contains no
+Minecraft assets, jars, or game files.
 
 ## Status
 
 | Area | State |
 | --- | --- |
-| Rust workspace | Building on stable Rust; 101 unit/integration tests |
+| Rust workspace | Building on stable Rust; 148 unit/integration tests |
 | Renderer | Software RGBA8 rasterizer with primitives, clipping, alpha blending, draw lists, and `Camera2D` |
 | Runtime | Fixed timestep, accumulation and drop accounting, lifecycle FSM, resize handling |
 | Input | Multi-touch state, tap/drag/pinch detectors, virtual joystick, touch button |
 | Resources | Traversal-safe paths, memory/file sources, checksummed `RKBPAK1` archives, LRU cache |
+| Minecraft data | Read-only 1.21/1.21.1 saved-world reader: NBT, Anvil regions, chunk palettes, block states, registry reports, `rkb-world` CLI |
 | Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host, landscape sandbox, lifecycle and touch wiring |
 | CI | Format, clippy, tests, release build, demo artifact, NDK ARM64 build, APK and ABI verification |
 
@@ -26,6 +29,23 @@ The software renderer is intentional. It keeps the core testable on any host and
 gives Android a working end-to-end path without requiring GPU drivers in CI. The
 `RenderBackend` and draw-list seam is where a future OpenGL ES/Vulkan backend
 belongs.
+
+## Minecraft 1.21 world inspection
+
+`rkb-mc` reads data from a world the user already owns. It bundles no Mojang
+content and does not download anything.
+
+```bash
+cargo run -p rkb-mc --bin rkb-world -- info /path/to/world
+cargo run -p rkb-mc --bin rkb-world -- block /path/to/world 0 -64 0
+cargo run -p rkb-mc --bin rkb-world -- chunk /path/to/world 0 0
+cargo run -p rkb-mc --bin rkb-world -- registry /path/to/blocks.json
+```
+
+Only `DataVersion` 3953 (1.21) and 3955 (1.21.1) are verified. Other versions
+are rejected instead of being guessed. See
+[`docs/minecraft-1.21.md`](docs/minecraft-1.21.md) for the format, limits, and
+roadmap.
 
 ## Quick start (host)
 
@@ -131,6 +151,7 @@ behavior remain manual checks.
 | `rkb-sandbox` | Embedded config/scene assets and the interactive sandbox `Game` |
 | `rkb-demo` | Headless CLI that runs the sandbox and writes a PPM frame |
 | `rkb-pak` | CLI to pack, list, verify, and unpack `RKBPAK1` archives |
+| `rkb-mc` | Minecraft: Java Edition 1.21 NBT, Anvil regions, chunk palettes, block registry, world access, and `rkb-world` CLI |
 | `rkb-android` | JNI exports and host-testable Android engine/bridge |
 
 ## Asset archives
@@ -169,6 +190,14 @@ the Android NDK cross-compile, Gradle APK build, and artifact uploads.
 
 - No network access, no scripting runtime, no third-party game code, and no
   credentials in the repository.
+- `rkb-mc` is read-only and covers only 1.21/1.21.1 DataVersions. It ignores
+  biomes, heightmaps, block entities, entities, structures, and lighting, and
+  does not decode LZ4 region compression.
+- No Minecraft terrain rendering, movement, inventory, or survival gameplay is
+  implemented yet; the Android app is still the sandbox. The Minecraft data
+  layer is not wired into `Runtime` or the Android UI.
+- No Minecraft assets, jars, data packs, or registry reports are bundled. Users
+  supply their own files.
 - JNI handles are process-local raw pointers; the Kotlin host must call
   `nativeDestroy` exactly once and must not use a handle after destruction.
 - Native code is single-threaded by contract; the Kotlin host confines calls to
@@ -180,7 +209,9 @@ the Android NDK cross-compile, Gradle APK build, and artifact uploads.
   ARM64 build, APK packaging, manifest, and JNI contract checks.
 - The project is early-stage; APIs may change before `1.0`.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`SECURITY.md`](SECURITY.md).
+See [`ARCHITECTURE.md`](ARCHITECTURE.md), [`SECURITY.md`](SECURITY.md),
+[`docs/horizon-analysis.md`](docs/horizon-analysis.md), and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## License
 

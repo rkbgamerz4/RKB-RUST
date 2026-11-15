@@ -22,6 +22,10 @@ Kotlin render thread
 On the host, `HeadlessSurface` replaces `DirectBufferSurface`; `rkb-demo` uses
 the same `Runtime` and `rkb-sandbox` scene.
 
+`rkb-mc` is a separate data layer for Minecraft 1.21 saved worlds. It is not yet
+wired into `Runtime`, the sandbox, or the Android UI; it is exercised by its own
+tests and the `rkb-world` CLI.
+
 ## Crates
 
 ### `rkb-core`
@@ -82,6 +86,37 @@ preserved and the queue is bounded.
 - `RKBPAK1` is a deterministic archive: sorted entries, explicit offsets,
   sizes, and per-entry checksums.
 - `ResourceManager` provides a byte-budgeted LRU cache and statistics.
+
+### `rkb-mc`
+
+Minecraft: Java Edition 1.21 saved-world compatibility, with no Android or GPU
+dependency:
+
+- `nbt`: Java NBT read/write, modified UTF-8, gzip/zlib, strict limits.
+- `region`: Anvil `.mca` headers, chunk locations, gzip/zlib/uncompressed
+  chunks, and a deterministic `RegionWriter` for synthetic fixtures.
+- `chunk`: 1.21 section parsing, block-state palettes, non-spanning packed
+  values, and world-Y block lookup.
+- `registry`: block-state identities and defaults from a user-supplied,
+  version-pinned Mojang `blocks.json` report.
+- `version`: explicit DataVersion descriptors. Only 1.21 (3953) and 1.21.1
+  (3955) are marked verified.
+- `world`: validates `level.dat`, opens `region/r.X.Z.mca` on demand, validates
+  chunk coordinates and versions, and caches loaded chunks.
+
+`rkb-world` is the inspection CLI (`info`, `block`, `chunk`, `registry`). The
+crate contains no Minecraft assets, jars, or world files. Tests generate their
+own NBT and region bytes. See [`docs/minecraft-1.21.md`](docs/minecraft-1.21.md).
+
+```text
+World::open(save)
+  ├─ level.dat (gzip NBT) -> DataVersion -> Versions::require
+  └─ block_at(x, y, z)
+       ├─ chunk coords = floor(x/16), floor(z/16)
+       ├─ region/r.floor(chunk/32).mca -> RegionFile
+       ├─ decompress -> NBT -> Chunk::parse
+       └─ section Y = floor(y/16) -> palette cell
+```
 
 ### `rkb-runtime`
 
@@ -159,8 +194,8 @@ this with `Choreographer`/vsync.
 ## Build and CI
 
 - Host CI: fmt, clippy (`-D warnings`), tests, release build, demo artifact.
-- Android CI: install NDK, cross-compile `aarch64-linux-android`, copy the `.so`
-  into `jniLibs`, build the debug APK with Gradle, verify the packaged
-  `lib/arm64-v8a/librkb_android.so`, inspect manifest badging, and upload the
-  APK plus a verification report.
+- Android CI: install NDK, cross-compile `aarch64-linux-android` (including
+  `rkb-mc`), copy the `.so` into `jniLibs`, build the debug APK with Gradle,
+  verify the packaged `lib/arm64-v8a/librkb_android.so`, inspect manifest
+  badging, and upload the APK plus a verification report.
 - All workflows use read-only `contents` permissions and pinned action commits.
