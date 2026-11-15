@@ -79,14 +79,14 @@ assert_process_alive() {
     local first_pid late_pid
 
     first_pid="$(pid_from_dump "${OUT}/emulator-activities${suffix}.txt")"
-    late_pid="$(pid_from_dump "${OUT}/emulator-activities-late${suffix}.txt")"
-    log "pid from dumpsys (${suffix}): first=${first_pid:-unknown} late=${late_pid:-unknown}"
-    [ -n "${first_pid}" ] || fail "${suffix}: dumpsys did not report a ProcessRecord for ${PKG}"
+    late_pid="$(pid_from_dump "${OUT}/emulator-activities${suffix}-late.txt")"
+    log "pid from dumpsys (${suffix:-save}): first=${first_pid:-unknown} late=${late_pid:-unknown}"
+    [ -n "${first_pid}" ] || fail "${suffix:-save}: dumpsys did not report a ProcessRecord for ${PKG}"
     [ "${first_pid}" = "${late_pid}" ] \
-        || fail "${suffix}: ${PKG} was restarted (${first_pid} -> ${late_pid})"
-    adb shell test -d "/proc/${late_pid}" || fail "${suffix}: /proc/${late_pid} disappeared"
+        || fail "${suffix:-save}: ${PKG} was restarted (${first_pid} -> ${late_pid})"
+    adb shell test -d "/proc/${late_pid}" || fail "${suffix:-save}: /proc/${late_pid} disappeared"
 
-    for dump in "emulator-activities${suffix}.txt" "emulator-activities-late${suffix}.txt"; do
+    for dump in "emulator-activities${suffix}.txt" "emulator-activities${suffix}-late.txt"; do
         grep -q "topResumedActivity=ActivityRecord{.*${PKG}/.MainActivity" "${OUT}/${dump}" \
             || fail "${dump}: ${PKG}/.MainActivity is not the top resumed activity"
         grep -q 'state=RESUMED' "${OUT}/${dump}" \
