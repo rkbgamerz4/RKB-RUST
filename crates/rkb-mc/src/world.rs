@@ -328,9 +328,7 @@ impl std::error::Error for WorldError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        block, cells, chunk_tag, level_tag, section_tag, write_world, TempDir,
-    };
+    use crate::fixture::{block, cells, chunk_tag, level_tag, section_tag, write_world, TempDir};
 
     fn one_block_section(y: i8, name: &str) -> crate::nbt::Tag {
         section_tag(y, &[block(name)], &cells(&[]))
@@ -366,7 +364,8 @@ mod tests {
                 chunk_tag(3955, 32, 0, vec![one_block_section(0, "minecraft:sand")]),
             ),
         ];
-        write_world(dir.path(), &level_tag(3955, "Synthetic"), &chunks);
+        write_world(dir.path(), &level_tag(3955, "Synthetic"), &chunks)
+            .expect("write synthetic world");
 
         let mut world = World::open(dir.path()).expect("open world");
         assert_eq!(world.level().data_version, 3955);
@@ -420,7 +419,8 @@ mod tests {
             0,
             chunk_tag(3953, 0, 0, vec![one_block_section(0, "minecraft:stone")]),
         )];
-        write_world(dir.path(), &level_tag(3953, "Unloaded"), &chunks);
+        write_world(dir.path(), &level_tag(3953, "Unloaded"), &chunks)
+            .expect("write synthetic world");
         let mut world = World::open(dir.path()).expect("open world");
         assert!(world.block_at(1000, 0, 0).expect("query").is_none());
         assert!(world.block_at(0, 1000, 0).expect("query").is_none());
@@ -448,7 +448,7 @@ mod tests {
                 chunk_tag(3955, 32, 0, vec![one_block_section(0, "minecraft:stone")]),
             ),
         ];
-        write_world(dir.path(), &level_tag(3955, "Stats"), &chunks);
+        write_world(dir.path(), &level_tag(3955, "Stats"), &chunks).expect("write synthetic world");
         let world = World::open(dir.path()).expect("open world");
         let stats = world.stats().expect("stats");
         assert_eq!(stats.regions, 2);
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn rejects_unknown_versions_and_reports_the_supported_set() {
         let dir = TempDir::new("world-version");
-        write_world(dir.path(), &level_tag(4080, "Future"), &[]);
+        write_world(dir.path(), &level_tag(4080, "Future"), &[]).expect("write synthetic world");
         let error = World::open(dir.path()).expect_err("1.21.2 is not verified");
         assert!(error
             .to_string()
@@ -478,7 +478,8 @@ mod tests {
             0,
             chunk_tag(3837, 0, 0, vec![one_block_section(0, "minecraft:stone")]),
         )];
-        write_world(dir.path(), &level_tag(3955, "Chunk version"), &chunks);
+        write_world(dir.path(), &level_tag(3955, "Chunk version"), &chunks)
+            .expect("write synthetic world");
         let mut world = World::open(dir.path()).expect("open world");
         let error = world.block_at(0, 0, 0).expect_err("old chunk");
         assert!(matches!(error, WorldError::ChunkVersion { .. }));
@@ -492,7 +493,8 @@ mod tests {
             0,
             chunk_tag(3955, 7, 0, vec![one_block_section(0, "minecraft:stone")]),
         )];
-        write_world(dir.path(), &level_tag(3955, "Wrong slot"), &chunks);
+        write_world(dir.path(), &level_tag(3955, "Wrong slot"), &chunks)
+            .expect("write synthetic world");
         let mut world = World::open(dir.path()).expect("open world");
         assert!(matches!(
             world.block_at(0, 0, 0),

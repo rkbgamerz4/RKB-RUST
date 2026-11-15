@@ -30,6 +30,21 @@ mkdir -p "${OUT}"
 log "installing ${APK}"
 adb install -r "${APK}"
 
+# Generate a synthetic, legally unencumbered 1.21 save and install it into the
+# app's private storage. This exercises the real save reader, chunk mesher,
+# collision, and renderer on the device without bundling any Minecraft data.
+log "generating synthetic 1.21 save"
+rm -rf "${OUT}/fixture-world"
+(
+    cd "${ROOT}"
+    cargo run --quiet --locked -p rkb-minecraft --bin rkb-fixture -- "${OUT}/fixture-world"
+)
+adb shell rm -rf /data/local/tmp/rkb-fixture-world
+adb push "${OUT}/fixture-world" /data/local/tmp/rkb-fixture-world
+adb shell "run-as ${PKG} sh -c 'rm -rf files/minecraft/world && mkdir -p files/minecraft && cp -r /data/local/tmp/rkb-fixture-world files/minecraft/world'"
+adb shell "run-as ${PKG} test -f files/minecraft/world/level.dat" \
+    || fail "fixture save was not copied into app storage"
+
 # Suppress the one-time immersive-mode cling so screenshots show the app.
 adb shell settings put secure immersive_mode_confirmations confirmed || true
 adb logcat -c
@@ -84,6 +99,19 @@ grep -q 'native engine created' "${OUT}/emulator-logcat.txt" \
     || fail "native engine was never created"
 grep -q 'first frame presented' "${OUT}/emulator-logcat.txt" \
     || fail "no frame was presented"
+grep -q 'minecraft client: world=loaded' "${OUT}/emulator-logcat.txt" \
+    || fail "the Minecraft client did not load the supplied save"
+grep -q 'RKB Demo Island' "${OUT}/emulator-logcat.txt" \
+    || fail "the loaded save was not identified"
+grep -qE 'world=loaded chunks=[1-9][0-9]*/' "${OUT}/emulator-logcat.txt" \
+    || fail "no chunks were streamed"
+grep -qE 'faces=[1-9][0-9]*' "${OUT}/emulator-logcat.txt" \
+    || fail "no block faces were meshed"
+grep -qE 'tris=[1-9][0-9]*' "${OUT}/emulator-logcat.txt" \
+    || fail "no block triangles were rendered"
+if grep -q 'balls=' "${OUT}/emulator-logcat.txt"; then
+    fail "the old sandbox is still running"
+fi
 
 if grep -qE "${CRASH_PATTERN}" "${OUT}/emulator-logcat.txt"; then
     grep -n -B2 -A60 -E "${CRASH_PATTERN}" "${OUT}/emulator-logcat.txt"
@@ -96,6 +124,6 @@ if grep -qE 'ANR in com\.rkb\.rust|am_anr.*com\.rkb\.rust' "${OUT}/emulator-logc
 fi
 
 log "startup summary"
-grep -E 'RKB RUST native version|native engine created|first frame presented' \
+grep -E 'RKB RUST native version|native engine created|first frame presented|minecraft client:|world=loaded chunks=' \
     "${OUT}/emulator-logcat.txt" || true
-log "PASS: ${PKG} stayed open, rendered frames, and logged no crash"
+log "PASS: ${PKG} stayed open, loaded a 1.21 save, rendered block geometry, and logged no crash"

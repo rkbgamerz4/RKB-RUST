@@ -2,7 +2,9 @@ package com.rkb.rust
 
 import android.app.Activity
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -14,7 +16,9 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.widget.FrameLayout
 import android.widget.TextView
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -27,12 +31,25 @@ import java.util.concurrent.ConcurrentLinkedQueue
  */
 class MainActivity : Activity() {
     private var view: RkbView? = null
+    private var overlay: TextView? = null
 
     @Volatile
     private var activityResumed = false
 
     @Volatile
     private var engineHandle: Long = 0L
+
+    /** User save location. ADB can push a 1.21 world here on debuggable builds. */
+    private val worldDir: File by lazy {
+        val external = getExternalFilesDir(null)?.let { File(it, "minecraft/world") }
+        val internal = File(filesDir, "minecraft/world")
+        val hasSave = { dir: File? -> dir?.let { File(it, "level.dat").isFile } == true }
+        when {
+            hasSave(external) -> external!!
+            hasSave(internal) -> internal
+            else -> external ?: internal
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,14 +60,54 @@ class MainActivity : Activity() {
                 showStartupError(getString(R.string.native_load_error))
                 return
             }
+            try {
+                worldDir.parentFile?.mkdirs()
+            } catch (error: SecurityException) {
+                Log.w(TAG, "could not create the world directory", error)
+            }
             Log.i(TAG, "RKB RUST native version ${RkbNative.nativeVersion()}")
-            view = RkbView().also { setContentView(it) }
+            Log.i(TAG, "Minecraft save directory: ${worldDir.absolutePath}")
+
+            val rkbView = RkbView()
+            val status = TextView(this).apply {
+                setTextColor(Color.WHITE)
+                textSize = 11f
+                setPadding(18, 14, 18, 14)
+                setBackgroundColor(Color.argb(150, 8, 12, 20))
+                setShadowLayer(2f, 0f, 1f, Color.BLACK)
+                text = overlayText("Starting Rust engine…")
+            }
+            val root = FrameLayout(this)
+            root.addView(
+                rkbView,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+            root.addView(
+                status,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { gravity = Gravity.TOP },
+            )
+            view = rkbView
+            overlay = status
+            setContentView(root)
         } catch (error: Throwable) {
             Log.e(TAG, "startup failed", error)
             showStartupError(error.message ?: error.javaClass.simpleName)
         } finally {
             hideSystemUi()
         }
+    }
+
+    private fun overlayText(stats: String): String = buildString {
+        append(stats)
+        append("\nLeft stick: move · Drag: look · JUMP / FLY")
+        append("\nSave: ")
+        append(worldDir.absolutePath)
     }
 
     private fun showStartupError(detail: String) {
@@ -152,6 +209,12 @@ class MainActivity : Activity() {
         private var bufferHeight = 0
 
         @Volatile
+        private var surfaceWidth = 0
+
+        @Volatile
+        private var surfaceHeight = 0
+
+        @Volatile
         private var lastFrameNanos = 0L
 
         private var frameCount = 0L
@@ -246,7 +309,11 @@ class MainActivity : Activity() {
                     ensureBuffers(width, height)
 
                     if (engineHandle == 0L) {
-                        engineHandle = RkbNative.nativeCreate(width, height)
+                        engineHandle = RkbNative.nativeCreate(
+                            bufferWidth,
+                            bufferHeight,
+                            worldDir.absolutePath,
+                        )
                         if (engineHandle == 0L) {
                             Log.e(TAG, "nativeCreate failed")
                             running = false
@@ -269,16 +336,33 @@ class MainActivity : Activity() {
                     val buffer = frameBuffer
                     val target = bitmap
                     if (buffer != null && target != null) {
-                        if (RkbNative.nativeRenderFrame(engineHandle, buffer, width, height, delta)) {
+                        if (
+                            RkbNative.nativeRenderFrame(
+                                engineHandle,
+                                buffer,
+                                bufferWidth,
+                                bufferHeight,
+                                delta,
+                            )
+                        ) {
                             buffer.rewind()
                             target.copyPixelsFromBuffer(buffer)
-                            canvas.drawBitmap(target, 0f, 0f, null)
+                            canvas.drawBitmap(
+                                target,
+                                null,
+                                Rect(0, 0, width, height),
+                                null,
+                            )
                             frameCount++
                             if (frameCount == 1L) {
                                 Log.i(TAG, "first frame presented (${width}x$height)")
                             }
-                            if (frameCount % 300L == 0L) {
-                                Log.i(TAG, RkbNative.nativeStats(engineHandle))
+                            if (frameCount == 1L || frameCount % 30L == 0L) {
+                                val stats = RkbNative.nativeStats(engineHandle)
+                                if (frameCount == 1L || frameCount % 60L == 0L) {
+                                    Log.i(TAG, stats)
+                                }
+                                updateOverlay(stats)
                             }
                         }
                     }
@@ -309,13 +393,19 @@ class MainActivity : Activity() {
             }
         }
 
-        private fun ensureBuffers(width: Int, height: Int) {
+        private fun ensureBuffers(surfaceWidth: Int, surfaceHeight: Int) {
+            this.surfaceWidth = surfaceWidth
+            this.surfaceHeight = surfaceHeight
+            // The software rasterizer is fill-rate bound; render below native
+            // resolution and let the compositor scale the bitmap up.
+            val width = (surfaceWidth * RENDER_SCALE).toInt().coerceAtLeast(240)
+            val height = (surfaceHeight * RENDER_SCALE).toInt().coerceAtLeast(135)
             if (width == bufferWidth && height == bufferHeight && frameBuffer != null) {
                 return
             }
             val bytes = width.toLong() * height.toLong() * 4L
             check(bytes in 4..Int.MAX_VALUE.toLong()) {
-                "invalid surface size ${width}x$height"
+                "invalid render size ${width}x$height"
             }
             frameBuffer = ByteBuffer.allocateDirect(bytes.toInt()).order(ByteOrder.nativeOrder())
             val oldBitmap = bitmap
@@ -323,6 +413,15 @@ class MainActivity : Activity() {
             oldBitmap?.recycle()
             bufferWidth = width
             bufferHeight = height
+        }
+
+        private fun updateOverlay(stats: String) {
+            val current = overlay ?: return
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) {
+                    current.text = overlayText(stats)
+                }
+            }
         }
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -379,12 +478,24 @@ class MainActivity : Activity() {
             }
             while (true) {
                 val sample = touchQueue.poll() ?: return
+                // Touch arrives in surface pixels; native input is laid out in
+                // render-buffer pixels.
+                val x = if (surfaceWidth > 0) {
+                    sample.x * bufferWidth / surfaceWidth
+                } else {
+                    sample.x
+                }
+                val y = if (surfaceHeight > 0) {
+                    sample.y * bufferHeight / surfaceHeight
+                } else {
+                    sample.y
+                }
                 RkbNative.nativeTouch(
                     handle,
                     sample.action,
                     sample.pointerId,
-                    sample.x,
-                    sample.y,
+                    x,
+                    y,
                     sample.timeMs,
                 )
             }
@@ -408,5 +519,6 @@ class MainActivity : Activity() {
         const val TAG = "RKB-RUST"
         const val FRAME_NANOS = 16_666_667L
         const val MAX_QUEUED_TOUCHES = 512
+        const val RENDER_SCALE = 0.6f
     }
 }

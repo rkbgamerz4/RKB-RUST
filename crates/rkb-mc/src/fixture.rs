@@ -1,10 +1,15 @@
-//! Synthetic saves for this crate's tests.
+//! Synthetic saves for tests and verification.
 //!
 //! Everything here is generated: no Minecraft assets, game files, or Mojang
 //! data are included. The helpers write the same NBT and region layout that a
 //! 1.21 save uses so the reader is exercised end to end.
+//!
+//! These builders are deliberately generic. Terrain layout belongs to
+//! `rkb-minecraft`'s demo-world generator, which composes them into a
+//! structurally valid save for tests and emulator verification.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +17,20 @@ use crate::chunk::BlockState;
 use crate::nbt::{Nbt, Tag};
 use crate::region::{Compression, RegionWriter};
 
+/// Failure while writing a synthetic save.
+#[derive(Debug)]
+pub struct FixtureError(pub String);
+
+impl fmt::Display for FixtureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FixtureError {}
+
 /// A unique temporary directory removed when the test ends.
+#[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,
 }
@@ -122,10 +140,18 @@ pub fn level_tag(data_version: i32, name: &str) -> Tag {
 }
 
 /// Writes `level.dat` and one zlib-compressed region file per affected region.
-pub fn write_world(dir: &Path, level: &Tag, chunks: &[(i32, i32, Tag)]) {
-    fs::create_dir_all(dir.join("region")).expect("create region directory");
-    let level_bytes = Nbt::write_gzip(level).expect("encode level.dat");
-    fs::write(dir.join("level.dat"), level_bytes).expect("write level.dat");
+pub fn write_world(
+    dir: &Path,
+    level: &Tag,
+    chunks: &[(i32, i32, Tag)],
+) -> Result<(), FixtureError> {
+    let region_dir = dir.join("region");
+    fs::create_dir_all(&region_dir)
+        .map_err(|error| FixtureError(format!("create {}: {error}", region_dir.display())))?;
+    let level_bytes = Nbt::write_gzip(level)
+        .map_err(|error| FixtureError(format!("encode level.dat: {error}")))?;
+    fs::write(dir.join("level.dat"), level_bytes)
+        .map_err(|error| FixtureError(format!("write level.dat: {error}")))?;
 
     let mut regions: BTreeMap<(i32, i32), RegionWriter> = BTreeMap::new();
     for (x, z, tag) in chunks {
@@ -136,11 +162,13 @@ pub fn write_world(dir: &Path, level: &Tag, chunks: &[(i32, i32, Tag)]) {
             .entry(region)
             .or_default()
             .add_chunk_nbt(local_x, local_z, Compression::Zlib, tag)
-            .expect("add synthetic chunk");
+            .map_err(|error| FixtureError(format!("add chunk ({x}, {z}): {error}")))?;
     }
     for ((x, z), writer) in regions {
+        let path = region_dir.join(format!("r.{x}.{z}.mca"));
         writer
-            .write_to(dir.join("region").join(format!("r.{x}.{z}.mca")))
-            .expect("write synthetic region");
+            .write_to(&path)
+            .map_err(|error| FixtureError(format!("write {}: {error}", path.display())))?;
     }
+    Ok(())
 }

@@ -1,8 +1,47 @@
 //! Render commands, a 2D camera, and the software backend.
 
-use rkb_core::{Rect, Vec2};
+use rkb_core::{Rect, Vec2, Vec3};
 
 use crate::{Color, Framebuffer};
+
+/// A projected triangle vertex for the depth-tested 3D path.
+///
+/// `x` and `y` are framebuffer pixels, `depth` is normalized device Z in
+/// `[0, 1]` (lower is closer), and `inv_w` is the reciprocal clip-space `w`
+/// used for perspective-correct depth interpolation. The game is responsible
+/// for clipping triangles against the near plane before submitting them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vertex3D {
+    pub x: f32,
+    pub y: f32,
+    pub depth: f32,
+    pub inv_w: f32,
+}
+
+impl Vertex3D {
+    #[must_use]
+    pub const fn new(x: f32, y: f32, depth: f32, inv_w: f32) -> Self {
+        Self { x, y, depth, inv_w }
+    }
+}
+
+/// Builds a projected vertex from clip-space coordinates.
+#[must_use]
+pub fn project_clip(clip: Vec3, w: f32, viewport: Vec2) -> Vertex3D {
+    let inv_w = if w.abs() > f32::EPSILON { 1.0 / w } else { 0.0 };
+    let ndc_x = clip.x * inv_w;
+    let ndc_y = clip.y * inv_w;
+    let ndc_z = clip.z * inv_w;
+    Vertex3D {
+        x: (ndc_x * 0.5 + 0.5) * viewport.x,
+        // Framebuffer rows run top to bottom, clip-space Y runs bottom to top.
+        y: (0.5 - ndc_y * 0.5) * viewport.y,
+        // Clipping lands exactly on the near plane; rounding can put the
+        // value a hair outside the unit range, so clamp it here.
+        depth: ((ndc_z + 1.0) * 0.5).clamp(0.0, 1.0),
+        inv_w,
+    }
+}
 
 /// A single draw operation.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -30,6 +69,13 @@ pub enum DrawCommand {
         a: Vec2,
         b: Vec2,
         c: Vec2,
+        color: Color,
+    },
+    /// A depth-tested, flat-shaded triangle in screen space.
+    Triangle3D {
+        a: Vertex3D,
+        b: Vertex3D,
+        c: Vertex3D,
         color: Color,
     },
     GradientTriangle {
@@ -100,6 +146,11 @@ impl DrawList {
         self.push(DrawCommand::Triangle { a, b, c, color });
     }
 
+    /// Queues a depth-tested 3D triangle.
+    pub fn triangle_3d(&mut self, a: Vertex3D, b: Vertex3D, c: Vertex3D, color: Color) {
+        self.push(DrawCommand::Triangle3D { a, b, c, color });
+    }
+
     #[must_use]
     pub fn commands(&self) -> &[DrawCommand] {
         &self.commands
@@ -151,25 +202,34 @@ pub trait RenderBackend {
 #[derive(Debug)]
 pub struct SoftwareBackend {
     framebuffer: Framebuffer,
+    depth: Vec<f32>,
 }
 
 impl SoftwareBackend {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
         Self {
             framebuffer: Framebuffer::new(width, height),
+            depth: vec![1.0; width as usize * height as usize],
         }
     }
 }
 
 impl RenderBackend for SoftwareBackend {
     fn resize(&mut self, width: u32, height: u32) {
+        let width = width.max(1);
+        let height = height.max(1);
         self.framebuffer.resize(width, height);
+        self.depth.clear();
+        self.depth.resize(width as usize * height as usize, 1.0);
     }
 
     fn render(&mut self, list: &DrawList) -> Result<RenderStats, RenderError> {
         let framebuffer = &mut self.framebuffer;
         framebuffer.clear(list.clear_color());
+        self.depth.fill(1.0);
         let mut stats = RenderStats::default();
 
         for command in list.commands() {
@@ -194,6 +254,10 @@ impl RenderBackend for SoftwareBackend {
                     framebuffer.draw_triangle(a, b, c, color);
                     stats.triangles += 1;
                 }
+                DrawCommand::Triangle3D { a, b, c, color } => {
+                    rasterize_depth_triangle(framebuffer, &mut self.depth, a, b, c, color);
+                    stats.triangles += 1;
+                }
                 DrawCommand::GradientTriangle {
                     a,
                     b,
@@ -212,6 +276,82 @@ impl RenderBackend for SoftwareBackend {
 
     fn framebuffer(&self) -> &Framebuffer {
         &self.framebuffer
+    }
+}
+
+fn edge(a: Vertex3D, b: Vertex3D, px: f32, py: f32) -> f32 {
+    (px - a.x) * (b.y - a.y) - (py - a.y) * (b.x - a.x)
+}
+
+/// Fills a triangle with perspective-correct depth testing.
+///
+/// The game submits triangles already clipped against the near plane and
+/// projected into screen space, so this routine only handles the viewport
+/// bounding box and the depth comparison.
+fn rasterize_depth_triangle(
+    framebuffer: &mut Framebuffer,
+    depth: &mut [f32],
+    a: Vertex3D,
+    b: Vertex3D,
+    c: Vertex3D,
+    color: Color,
+) {
+    let width = framebuffer.width() as i32;
+    let height = framebuffer.height() as i32;
+    if width == 0 || height == 0 {
+        return;
+    }
+    let area = edge(a, b, c.x, c.y);
+    if area.abs() < f32::EPSILON {
+        return;
+    }
+    let min_x = a.x.min(b.x).min(c.x).floor().max(0.0) as i32;
+    let max_x = a.x.max(b.x).max(c.x).ceil().min(width as f32);
+    let min_y = a.y.min(b.y).min(c.y).floor().max(0.0) as i32;
+    let max_y = a.y.max(b.y).max(c.y).ceil().min(height as f32);
+    if min_x >= max_x as i32 || min_y >= max_y as i32 {
+        return;
+    }
+
+    let inverse_area = 1.0 / area;
+    let pixels = framebuffer.pixels_mut();
+    for y in min_y..max_y as i32 {
+        let py = y as f32 + 0.5;
+        for x in min_x..max_x as i32 {
+            let px = x as f32 + 0.5;
+            let w0 = edge(b, c, px, py);
+            let w1 = edge(c, a, px, py);
+            let w2 = edge(a, b, px, py);
+            let inside = if area > 0.0 {
+                w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0
+            } else {
+                w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0
+            };
+            if !inside {
+                continue;
+            }
+            let l0 = w0 * inverse_area;
+            let l1 = w1 * inverse_area;
+            let l2 = w2 * inverse_area;
+            let inv_w = l0 * a.inv_w + l1 * b.inv_w + l2 * c.inv_w;
+            let z = if inv_w.abs() > f32::EPSILON {
+                (l0 * a.depth * a.inv_w + l1 * b.depth * b.inv_w + l2 * c.depth * c.inv_w) / inv_w
+            } else {
+                l0 * a.depth + l1 * b.depth + l2 * c.depth
+            };
+            if !(0.0..=1.0).contains(&z) {
+                continue;
+            }
+            let index = y as usize * width as usize + x as usize;
+            if z < depth[index] {
+                depth[index] = z;
+                let offset = index * 4;
+                pixels[offset] = color.r;
+                pixels[offset + 1] = color.g;
+                pixels[offset + 2] = color.b;
+                pixels[offset + 3] = 255;
+            }
+        }
     }
 }
 
@@ -325,5 +465,75 @@ mod tests {
         assert_eq!(list.len(), 1);
         list.clear_commands();
         assert!(list.is_empty());
+    }
+
+    fn full_screen_triangle(depth: f32) -> (Vertex3D, Vertex3D, Vertex3D) {
+        (
+            Vertex3D::new(0.0, 0.0, depth, 1.0),
+            Vertex3D::new(16.0, 0.0, depth, 1.0),
+            Vertex3D::new(0.0, 16.0, depth, 1.0),
+        )
+    }
+
+    #[test]
+    fn depth_test_keeps_nearer_triangle_in_either_order() {
+        for order in [true, false] {
+            let mut backend = SoftwareBackend::new(16, 16);
+            let mut list = DrawList::new(Color::BLACK);
+            let (a, b, c) = full_screen_triangle(0.8);
+            let far = [a, b, c];
+            let (a, b, c) = full_screen_triangle(0.2);
+            let near = [a, b, c];
+            let (first, first_color, second, second_color) = if order {
+                (far, Color::BLUE, near, Color::RED)
+            } else {
+                (near, Color::RED, far, Color::BLUE)
+            };
+            list.triangle_3d(first[0], first[1], first[2], first_color);
+            list.triangle_3d(second[0], second[1], second[2], second_color);
+            let stats = backend.render(&list).unwrap();
+            assert_eq!(stats.triangles, 2);
+            assert_eq!(
+                backend.framebuffer().pixel(2, 2),
+                Some(Color::RED),
+                "nearer triangle must win (near first: {order})"
+            );
+        }
+    }
+
+    #[test]
+    fn depth_buffer_is_cleared_each_frame_and_on_resize() {
+        let mut backend = SoftwareBackend::new(8, 8);
+        let mut list = DrawList::new(Color::BLACK);
+        let (a, b, c) = full_screen_triangle(0.5);
+        list.triangle_3d(a, b, c, Color::GREEN);
+        backend.render(&list).unwrap();
+        assert_eq!(backend.framebuffer().pixel(1, 1), Some(Color::GREEN));
+
+        list.clear_commands();
+        list.set_clear_color(Color::BLACK);
+        let (a, b, c) = full_screen_triangle(0.9);
+        list.triangle_3d(a, b, c, Color::BLUE);
+        backend.render(&list).unwrap();
+        assert_eq!(backend.framebuffer().pixel(1, 1), Some(Color::BLUE));
+
+        backend.resize(4, 4);
+        let (a, b, c) = full_screen_triangle(0.9);
+        list.clear_commands();
+        list.triangle_3d(a, b, c, Color::YELLOW);
+        backend.render(&list).unwrap();
+        assert_eq!(backend.framebuffer().pixel(1, 1), Some(Color::YELLOW));
+    }
+
+    #[test]
+    fn project_clip_maps_center_and_edges() {
+        let viewport = Vec2::new(100.0, 50.0);
+        let center = project_clip(Vec3::new(0.0, 0.0, 0.0), 1.0, viewport);
+        assert_eq!((center.x, center.y), (50.0, 25.0));
+        assert!((center.depth - 0.5).abs() < 1.0e-6);
+
+        let corner = project_clip(Vec3::new(-1.0, 1.0, 1.0), 1.0, viewport);
+        assert_eq!((corner.x, corner.y), (0.0, 0.0));
+        assert!((corner.depth - 1.0).abs() < 1.0e-6);
     }
 }

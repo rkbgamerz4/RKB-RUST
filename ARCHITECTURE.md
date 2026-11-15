@@ -20,11 +20,32 @@ Kotlin render thread
 ```
 
 On the host, `HeadlessSurface` replaces `DirectBufferSurface`; `rkb-demo` uses
-the same `Runtime` and `rkb-sandbox` scene.
+the same `Runtime` with the `rkb-sandbox` scene, and `rkb-minecraft`'s render
+test drives `Runtime<MinecraftGame>` against a generated save.
 
-`rkb-mc` is a separate data layer for Minecraft 1.21 saved worlds. It is not yet
-wired into `Runtime`, the sandbox, or the Android UI; it is exercised by its own
-tests and the `rkb-world` CLI.
+`rkb-mc` is the data layer for Minecraft 1.21 saved worlds, and `rkb-minecraft`
+is the client built on it: the Android app now runs `Runtime<MinecraftGame>`,
+which opens a save, streams and meshes chunks around the player, and submits
+depth-tested 3D triangles alongside the 2D HUD.
+
+## Minecraft client data flow
+
+```text
+MinecraftGame::new(Some(save_dir))
+  └─ rkb_mc::World::open (level.dat, DataVersion gate)
+       └─ per-chunk: Anvil section -> block-state palette -> block lookup
+MinecraftGame::update
+  ├─ Player::step -> WorldQuery -> World::block_at (collision)
+  └─ ensure_area + load_one (2 chunks/step)
+       └─ build_chunk_mesh: 3x3 neighbourhood, hidden-face culling
+MinecraftGame::render
+  ├─ Camera::view_projection + Frustum::contains_aabb
+  ├─ back-face culling, near-plane clipping -> DrawCommand::Triangle3D
+  └─ sky gradient, distance fog, crosshair, joystick/buttons
+```
+
+`rkb-mc` remains read-only: the client never writes the save and keeps only the
+chunks near the player in memory.
 
 ## Crates
 
@@ -55,13 +76,18 @@ A deterministic software rasterizer:
 - `Color` with RGB/RGBA/hex parsing.
 - `Framebuffer` with bounds and clipping access.
 - Alpha blending and clipped lines, rectangles, circles, triangles.
+- A depth-tested perspective path: `Vertex3D` carries clip-space coordinates
+  and `1/w`; `project_clip` maps them to viewport pixels; `Triangle3D` is
+  rasterized with perspective-correct depth against a resizable depth buffer.
+  `Camera::project_polygon` clips polygons crossing the near plane first.
 - Texture sampling.
 - `DrawList`/`DrawCommand` + `RenderBackend` trait.
 - `SoftwareBackend` executes a frame into a framebuffer and reports statistics.
 - `Camera2D` maps world coordinates into the viewport.
 
-The backend trait is deliberately small so a GPU implementation can be added
-without touching game code.
+2D commands keep their painter's-order behaviour; only `Triangle3D` participates
+in the depth test. The backend trait is deliberately small so a GPU
+implementation can be added without touching game code.
 
 ### `rkb-input`
 
@@ -133,31 +159,56 @@ pointers across a resize or rotation would deliver stale positions.
 
 ### `rkb-sandbox`
 
-The executable proof of the stack. It embeds `config/engine.rkb` and
-`scenes/sandbox.rkb` with `include_bytes!`, loads them through the resource
-manager, parses config, and builds a scene with balls, a player, a grid, a
-virtual joystick, a burst button, tap spawning, pinch zoom, and camera panning.
-It is used by both the demo and Android.
+The executable proof of the original stack, now the headless demo only. It
+embeds `config/engine.rkb` and `scenes/sandbox.rkb` with `include_bytes!`, loads
+them through the resource manager, parses config, and builds a scene with balls,
+a player, a grid, a virtual joystick, a burst button, tap spawning, pinch zoom,
+and camera panning. The Android app no longer uses it; `rkb-demo` and its tests
+do.
+
+### `rkb-mc`
+
+Minecraft: Java Edition 1.21 save compatibility, with no Minecraft code or data.
+`nbt` parses modified-UTF-8 NBT, `region` reads Anvil `.mca` files and their zlib
+chunks, `chunk` decodes section palettes and block-state cells, `version` gates
+DataVersions (3953 for 1.21, 3955 for 1.21.1), and `world` exposes `level.dat`,
+spawn, chunk cache, and `block_at`. `fixture` generates synthetic saves for tests.
+
+### `rkb-minecraft`
+
+The playable client. `blocks` maps block names to approximate colours and a
+solidity rule, `mesh` builds per-chunk face lists with neighbour culling,
+`camera` provides view/projection, frustum planes, and polygon clipping,
+`player` implements AABB collision, gravity, jumping, and flight, `demo_world`
+writes the synthetic island, and `game` ties them into a `Game`: chunk
+streaming, touch input, scene drawing, and status text. The `rkb-fixture` binary
+writes that island for CI and emulator verification.
 
 ### `rkb-android`
 
 - `bridge.rs` contains host-testable `AndroidEngine`, `DirectBufferSurface`
   (checks the direct buffer capacity and framing), touch conversion, pause/
-  resume/destroy, and stats.
+  resume/destroy, and stats. `AndroidEngine` wraps `Runtime<MinecraftGame>` and
+  reports world state, chunk/face/triangle counts, and player position.
 - `lib.rs` exports `Java_com_rkb_rust_RkbNative_native*` functions, allocates
-  the engine with `Box::into_raw`, and logs through Android's log facility on
-  device.
-- The JNI surface is intentionally narrow: create, destroy, resize, render,
-  touch, pause, resume, stats, version.
+  the engine with `Box::into_raw`, converts the optional world path, logs the
+  `minecraft client: world=...` startup line, and logs through Android's log
+  facility on device.
+- The JNI surface is intentionally narrow: create (size plus world path),
+  destroy, resize, render, touch, pause, resume, stats, version.
 
 Kotlin `MainActivity` owns a single render thread, a direct `ByteBuffer`, an
 `ARGB_8888` bitmap, and a `SurfaceView`. It requests `RGBA_8888` surface format,
-creates the engine on the first frame, forwards lifecycle callbacks (after
+resolves the save directory (external files first, then internal), creates the
+engine on the first frame with that path, forwards lifecycle callbacks (after
 stopping the render thread), queues touch samples for the render thread, and
-copies the presented frame into the bitmap. The frame clock resets on every
-thread start, and `surfaceDestroyed` releases the bitmap and direct buffer only
-after the render thread has joined. A failed `System.loadLibrary` is captured
-and rendered as an error screen rather than aborting the process.
+copies the presented frame into the bitmap. Rendering happens at 0.6x the
+surface size and the bitmap is scaled up on draw; touch coordinates are scaled
+the same way. A status `TextView` overlays world status, chunk/face/triangle
+counts, and position. The frame clock resets on every thread start, and
+`surfaceDestroyed` releases the bitmap and direct buffer only after the render
+thread has joined. A failed `System.loadLibrary` is captured and rendered as an
+error screen rather than aborting the process.
 
 `crates/rkb-android/tests/jni_contract.rs` compares every Kotlin `external fun`
 name, parameter type, and return type against the Rust JNI exports, so contract
@@ -195,7 +246,12 @@ this with `Choreographer`/vsync.
 
 - Host CI: fmt, clippy (`-D warnings`), tests, release build, demo artifact.
 - Android CI: install NDK, cross-compile `aarch64-linux-android` (including
-  `rkb-mc`), copy the `.so` into `jniLibs`, build the debug APK with Gradle,
-  verify the packaged `lib/arm64-v8a/librkb_android.so`, inspect manifest
-  badging, and upload the APK plus a verification report.
+  `rkb-mc` and `rkb-minecraft`), copy the `.so` into `jniLibs`, build the debug
+  APK with Gradle, verify the packaged `lib/arm64-v8a/librkb_android.so`, inspect
+  manifest badging, and upload the APK plus a verification report.
+- Emulator CI: build a universal x86_64/ARM64 APK, boot an API 34 emulator,
+  generate the synthetic save with `rkb-fixture`, push it into app storage with
+  `run-as`, launch the activity, and assert from logcat that the client loaded
+  the save, streamed chunks, meshed faces, rendered triangles, presented a
+  frame, produced no crash, and is not running the old sandbox (`balls=`).
 - All workflows use read-only `contents` permissions and pinned action commits.

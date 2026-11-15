@@ -20,14 +20,12 @@
 #![forbid(unsafe_code)]
 
 pub mod chunk;
+pub mod fixture;
 pub mod nbt;
 pub mod region;
 pub mod registry;
 pub mod version;
 pub mod world;
-
-#[cfg(test)]
-mod test_support;
 
 pub use chunk::{BlockState, Chunk, Section};
 pub use nbt::{Nbt, Tag};

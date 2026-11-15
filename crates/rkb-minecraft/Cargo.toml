@@ -1,0 +1,26 @@
+[package]
+name = "rkb-minecraft"
+description = "Minecraft: Java Edition 1.21 block-world client for RKB RUST"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rkb-fixture"
+path = "src/bin/rkb-fixture.rs"
+
+[dependencies]
+rkb-core = { workspace = true }
+rkb-input = { workspace = true }
+rkb-mc = { workspace = true }
+rkb-render = { workspace = true }
+rkb-runtime = { workspace = true }
+
+[dev-dependencies]
+rkb-platform = { workspace = true }
+
+[lints]
+workspace = true

@@ -6,29 +6,98 @@ ARM64**, with a headless CLI demo and a native Android host.
 The project currently ships a deterministic software renderer, fixed-timestep
 runtime, touch/gesture input, a path-safe asset system with a custom `RKBPAK1`
 archive format, and a JNI bridge that presents frames through a Kotlin
-`SurfaceView`. It is a foundation and an interactive sandbox, **not yet a
-playable Minecraft client**. A separate `rkb-mc` crate now reads Minecraft: Java
-Edition 1.21 saved-world data (NBT, Anvil regions, chunk palettes, block states),
-but it is not yet connected to the Android runtime. The project contains no
-Minecraft assets, jars, or game files.
+`SurfaceView`. It also contains the **first playable milestone of a Minecraft:
+Java Edition 1.21 client**: user-supplied saves are read through `rkb-mc`,
+chunks are streamed and meshed, and opaque block geometry is rendered with a
+first-person camera, collision, and touch movement.
+
+This is not a complete Minecraft client. There are no textures, lighting,
+block breaking/placing, inventory, mobs, survival, or networking yet. The
+project contains no Minecraft assets, jars, or game files, and it does not
+bundle a world.
 
 ## Status
 
 | Area | State |
 | --- | --- |
-| Rust workspace | Building on stable Rust; 148 unit/integration tests |
-| Renderer | Software RGBA8 rasterizer with primitives, clipping, alpha blending, draw lists, and `Camera2D` |
+| Rust workspace | Building on stable Rust; 175 unit/integration tests |
+| Renderer | Software RGBA8 rasterizer with primitives, alpha blending, 2D camera, and a depth-tested perspective 3D triangle path |
 | Runtime | Fixed timestep, accumulation and drop accounting, lifecycle FSM, resize handling |
 | Input | Multi-touch state, tap/drag/pinch detectors, virtual joystick, touch button |
 | Resources | Traversal-safe paths, memory/file sources, checksummed `RKBPAK1` archives, LRU cache |
 | Minecraft data | Read-only 1.21/1.21.1 saved-world reader: NBT, Anvil regions, chunk palettes, block states, registry reports, `rkb-world` CLI |
-| Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host, landscape sandbox, lifecycle and touch wiring |
-| CI | Format, clippy, tests, release build, demo artifact, NDK ARM64 build, APK and ABI verification |
+| Minecraft client | `rkb-minecraft`: 1.21 save loading, chunk streaming and face meshing, depth-tested flat-colour block rendering, first-person camera, walking, jumping, creative flight, AABB collision, touch look/joystick/buttons |
+| Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host that launches the Minecraft client, 0.6x render scaling, status overlay, lifecycle and touch wiring |
+| CI | Format, clippy, tests, release build, demo artifact, NDK ARM64 build, APK and ABI verification, emulator world-load/render assertions |
 
 The software renderer is intentional. It keeps the core testable on any host and
 gives Android a working end-to-end path without requiring GPU drivers in CI. The
 `RenderBackend` and draw-list seam is where a future OpenGL ES/Vulkan backend
 belongs.
+
+## Minecraft 1.21 client (first milestone)
+
+`rkb-minecraft` is the client crate. It reads a save you already own, streams
+chunks around the player, meshes exposed block faces, and renders them as flat
+per-block colours with per-face shading. The Android APK launches this client;
+the old ball sandbox is no longer wired into the app and remains only as the
+headless stack demo.
+
+Implemented:
+
+- DataVersion-gated loading of 1.21 and 1.21.1 saves (`level.dat` + `region/`).
+- Chunk streaming across a 7x7 chunk area, neighbour-aware face culling, and
+  frustum culling.
+- Depth-tested perspective projection, near-plane clipping, and back-face
+  culling in the software renderer.
+- Spawn selection from `level.dat`, ground snapping, gravity, jumping,
+  creative flight, AABB collision, and fall respawn.
+- Touch controls: left joystick, drag-to-look, JUMP, FLY, and DOWN while flying.
+- Android host at 0.6x render scale with a status overlay showing the loaded
+  save, streamed chunk count, face count, triangle count, and position.
+
+Not implemented yet: textures/resource packs, biome tints, lighting/shadows,
+block shapes (slabs, stairs, fences, and other non-cube blocks are treated as
+full cubes for both rendering and collision), block breaking or placing,
+inventory, crafting, mobs, survival, sound, and networking. Block colours are
+approximations, not extracted Mojang textures.
+
+### Run a world on Android
+
+The app looks for a save in its external files directory first, then its private
+storage:
+
+- `Android/data/com.rkb.rust/files/minecraft/world` (external)
+- `files/minecraft/world` (internal)
+
+For a debuggable build, push a save with ADB:
+
+```bash
+adb push /path/to/my-world /data/local/tmp/rkb-world
+adb shell "run-as com.rkb.rust sh -c \
+  'rm -rf files/minecraft/world && mkdir -p files/minecraft && \
+   cp -r /data/local/tmp/rkb-world files/minecraft/world'"
+```
+
+If no save is present, the app starts with a status message and instructions
+instead of substituting demo content.
+
+### Generate a verification world
+
+The `rkb-fixture` binary writes a synthetic, structurally valid 1.21 save. It
+contains no Mojang data and is intended for tests and emulator verification:
+
+```bash
+cargo run -p rkb-minecraft --bin rkb-fixture -- /tmp/rkb-demo-world
+cargo run -p rkb-mc --bin rkb-world -- info /tmp/rkb-demo-world
+```
+
+The host render test loads the same fixture through `Runtime<MinecraftGame>`:
+
+```bash
+RKB_RENDER_OUT=/tmp/rkb-demo.ppm \
+  cargo test -p rkb-minecraft --test demo_render -- --nocapture
+```
 
 ## Minecraft 1.21 world inspection
 
@@ -57,7 +126,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Run the interactive sandbox logic headlessly and write a frame:
+Run the interactive sandbox logic headlessly and write a frame (the sandbox is
+the stack demo, not the Android game):
 
 ```bash
 cargo run -p rkb-demo --release -- \
@@ -130,7 +200,17 @@ timing must be measured on hardware. No physical device was available during
 this phase; installation, launch, touch, rotation, and background/foreground
 behavior remain manual checks.
 
-## Controls in the sandbox
+## Controls
+
+Minecraft client (Android):
+
+- Left joystick: walk.
+- Drag anywhere outside the controls: look around.
+- **JUMP** (bottom-right): jump, or ascend while flying.
+- **FLY** (above jump): toggle creative flight.
+- **DOWN** (left of jump, visible while flying): descend.
+
+Headless sandbox demo (`rkb-demo` and `rkb-sandbox` tests):
 
 - Drag on the left side: virtual joystick (moves the player).
 - Tap elsewhere: spawn a bouncing ball.
@@ -148,11 +228,12 @@ behavior remain manual checks.
 | `rkb-input` | Touch points/events, tap/drag/pinch detectors, virtual controls |
 | `rkb-resource` | Asset paths and IDs, memory/file sources, `RKBPAK1`, LRU cache |
 | `rkb-runtime` | Fixed-step loop, lifecycle, input forwarding, frame presentation |
-| `rkb-sandbox` | Embedded config/scene assets and the interactive sandbox `Game` |
+| `rkb-sandbox` | Embedded config/scene assets and the headless sandbox `Game` (no longer the Android game) |
 | `rkb-demo` | Headless CLI that runs the sandbox and writes a PPM frame |
 | `rkb-pak` | CLI to pack, list, verify, and unpack `RKBPAK1` archives |
 | `rkb-mc` | Minecraft: Java Edition 1.21 NBT, Anvil regions, chunk palettes, block registry, world access, and `rkb-world` CLI |
-| `rkb-android` | JNI exports and host-testable Android engine/bridge |
+| `rkb-minecraft` | 1.21 client: chunk streaming/meshing, camera, physics, touch controls, flat-colour block renderer, and the `rkb-fixture` generator |
+| `rkb-android` | JNI exports and host-testable Android engine/bridge that launches the Minecraft client |
 
 ## Asset archives
 
@@ -193,20 +274,28 @@ the Android NDK cross-compile, Gradle APK build, and artifact uploads.
 - `rkb-mc` is read-only and covers only 1.21/1.21.1 DataVersions. It ignores
   biomes, heightmaps, block entities, entities, structures, and lighting, and
   does not decode LZ4 region compression.
-- No Minecraft terrain rendering, movement, inventory, or survival gameplay is
-  implemented yet; the Android app is still the sandbox. The Minecraft data
-  layer is not wired into `Runtime` or the Android UI.
-- No Minecraft assets, jars, data packs, or registry reports are bundled. Users
-  supply their own files.
+- The Minecraft client is a first milestone, not a complete game. It renders
+  blocks as opaque full cubes with flat approximate colours: no textures,
+  resource packs, biome tints, lighting, shadows, or transparent blocks.
+  Non-cube shapes such as slabs, stairs, and fences are treated as full cubes,
+  so geometry and collision boxes for those blocks are approximate.
+- Block breaking/placing, inventory, crafting, mobs, survival, sound, and
+  networking are not implemented. Interaction is limited to moving and looking.
+- World edits are never written back; the save is opened read-only and the
+  client holds at most the chunks around the player.
+- No Minecraft assets, jars, data packs, worlds, or registry reports are
+  bundled. Users supply their own legally obtained files. The synthetic save
+  from `rkb-fixture` is generated by RKB code and used only for verification.
 - JNI handles are process-local raw pointers; the Kotlin host must call
   `nativeDestroy` exactly once and must not use a handle after destruction.
 - Native code is single-threaded by contract; the Kotlin host confines calls to
   one render thread.
-- The renderer is software-only today. Performance is adequate for the sandbox,
-  not for large 3D scenes.
+- The renderer is software-only today. Android renders at 0.6x resolution to
+  stay interactive; frame rate on large or dense saves is not yet characterized
+  on real hardware.
 - Android installation, launch, touch, rotation, and background/foreground
-  behavior have not yet been validated on a physical device; CI performs the
-  ARM64 build, APK packaging, manifest, and JNI contract checks.
+  behavior are validated in CI on an x86_64 emulator against a synthetic save.
+  Physical-device behavior and real user saves are not yet verified.
 - The project is early-stage; APIs may change before `1.0`.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md), [`SECURITY.md`](SECURITY.md),

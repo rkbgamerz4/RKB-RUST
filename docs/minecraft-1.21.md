@@ -288,21 +288,25 @@ property enums/integers, and block behaviour tables.
 
 ### 4. Terrain rendering
 
-Not implemented for Minecraft. The existing RKB software renderer can draw the
-sandbox, but there is no chunk mesher, texture atlas, or Minecraft terrain path
-yet. The render seam is `DrawList`/`RenderBackend`; a GPU backend must not be
-claimed until it is integrated and tested.
+Data support is done: `rkb-minecraft` streams chunks, meshes exposed block faces
+with neighbour culling, frustum-culls chunk bounds, and renders blocks through
+the software renderer's depth-tested 3D triangle path. Every non-air block is
+treated as a full cube with a flat approximate colour and per-face shading;
+there is no texture atlas, lightmap, block model, or shape support.
 
-Next: section meshing, face culling, texture atlas from a user's resource pack,
-lightmap sampling, frustum culling, and memory budgets for low/mid-range phones.
+Next: texture atlas from a user's resource pack, transparent and non-cube block
+models (slabs, stairs, fences), lightmap sampling, and memory/frame budgets for
+low/mid-range phones.
 
 ### 5. Player movement and camera
 
-Not implemented. Horizon's movement modules are an architectural reference, not
-copied code.
+Implemented in `rkb-minecraft`: a first-person camera, touch drag look, 0.6x1.8
+AABB collision with sub-stepping, gravity, jumping, creative flight, fall
+respawn, and a walking/jumping/flying player. Step-up, swimming, ladders,
+sprinting, sneaking, and jump cooldown are not implemented yet.
 
-Next: 1.21 movement constants, AABB collision, step-up, swimming, ladders,
-sprinting, sneaking, jump cooldown, and a first-person camera with touch look.
+Continue with: 1.21 movement constants, step-up and climbing, swimming,
+sprinting/sneaking, and movement on the Android touch layout.
 
 ### 6. Block breaking and placing
 
@@ -348,11 +352,14 @@ Next: health, hunger, damage, respawn, experience, and the survival HUD.
   ignored;
 - the registry is not bundled and is only used by the `registry` command, not
   yet to validate every palette entry;
-- no resource packs, terrain rendering, gameplay, or Android gameplay
-  integration;
-- no physical Android device was available. The Android evidence for this
-  milestone is an ARM64 `cargo check` plus the existing emulator startup smoke
-  test, not Minecraft rendering on hardware.
+- the client treats every block as a full cube with an approximate flat colour:
+  no textures, resource packs, biome tints, lighting, shadows, or partial-block
+  shapes (slabs, stairs, fences, and similar blocks render and collide as cubes);
+- block breaking/placing, inventory, crafting, mobs, survival, and networking
+  are not implemented;
+- the emulator workflow verifies world loading and block rendering against a
+  synthetic save. A physical Android device was not available, so real-hardware
+  touch and performance remain unverified.
 
 ## Tests
 

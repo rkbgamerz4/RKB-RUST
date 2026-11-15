@@ -355,6 +355,31 @@ impl Mat4 {
         out
     }
 
+    /// Transforms a point into homogeneous clip space, keeping `w`.
+    ///
+    /// Use this when a caller needs to clip against a frustum plane before
+    /// dividing, or needs the perspective-correct `1/w` for depth.
+    #[must_use]
+    pub fn transform_vec4(self, point: Vec3) -> [f32; 4] {
+        let x = self.cols[0][0].mul_add(
+            point.x,
+            self.cols[1][0].mul_add(point.y, self.cols[2][0].mul_add(point.z, self.cols[3][0])),
+        );
+        let y = self.cols[0][1].mul_add(
+            point.x,
+            self.cols[1][1].mul_add(point.y, self.cols[2][1].mul_add(point.z, self.cols[3][1])),
+        );
+        let z = self.cols[0][2].mul_add(
+            point.x,
+            self.cols[1][2].mul_add(point.y, self.cols[2][2].mul_add(point.z, self.cols[3][2])),
+        );
+        let w = self.cols[0][3].mul_add(
+            point.x,
+            self.cols[1][3].mul_add(point.y, self.cols[2][3].mul_add(point.z, self.cols[3][3])),
+        );
+        [x, y, z, w]
+    }
+
     /// Transforms a point, performing the perspective divide.
     #[must_use]
     pub fn transform_point(self, point: Vec3) -> Vec3 {

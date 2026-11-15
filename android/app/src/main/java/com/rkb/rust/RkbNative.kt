@@ -31,7 +31,7 @@ object RkbNative {
         }
     }
 
-    external fun nativeCreate(width: Int, height: Int): Long
+    external fun nativeCreate(width: Int, height: Int, worldPath: String): Long
     external fun nativeDestroy(handle: Long)
     external fun nativeResize(handle: Long, width: Int, height: Int): Boolean
     external fun nativeRenderFrame(

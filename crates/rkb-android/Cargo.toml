@@ -15,11 +15,14 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rkb-core.workspace = true
 rkb-input.workspace = true
+rkb-minecraft.workspace = true
 rkb-platform.workspace = true
 rkb-render.workspace = true
 rkb-runtime.workspace = true
-rkb-sandbox.workspace = true
 jni.workspace = true
+
+[dev-dependencies]
+rkb-mc.workspace = true
 
 [lints]
 workspace = true

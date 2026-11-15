@@ -152,10 +152,11 @@ dependencies = [
  "jni",
  "rkb-core",
  "rkb-input",
+ "rkb-mc",
+ "rkb-minecraft",
  "rkb-platform",
  "rkb-render",
  "rkb-runtime",
- "rkb-sandbox",
 ]
 
 [[package]]
@@ -186,6 +187,18 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "serde_json",
+]
+
+[[package]]
+name = "rkb-minecraft"
+version = "0.1.0"
+dependencies = [
+ "rkb-core",
+ "rkb-input",
+ "rkb-mc",
+ "rkb-platform",
+ "rkb-render",
+ "rkb-runtime",
 ]
 
 [[package]]

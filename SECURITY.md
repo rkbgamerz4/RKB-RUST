@@ -35,8 +35,9 @@ Out of scope:
 - Missing GPU acceleration.
 - Issues in upstream Rust, Android, Gradle, or Kotlin dependencies that are not
   exploitable through this project's code. Report those upstream.
-- Any claim of compatibility with Minecraft or third-party games. The project
-  does not provide such compatibility.
+- Compatibility with Minecraft versions outside the documented 1.21/1.21.1
+  DataVersions, or with any other third-party game. No broader compatibility is
+  claimed.
 
 ## Security properties
 

@@ -26,9 +26,10 @@ The script cross-compiles `crates/rkb-android`, copies the resulting
 packages it into an APK.
 
 Touch events are queued on the UI thread and delivered on the render thread so
-the native engine is never accessed concurrently. The APK is a rendering and
-touch-input sandbox. It is not a Minecraft client and does not claim
-compatibility with Minecraft or any third-party game.
+the native engine is never accessed concurrently. The APK launches the
+`rkb-minecraft` client: a first-person renderer for a Minecraft: Java Edition
+1.21 save that the user supplies. It contains no Minecraft assets and does not
+claim compatibility beyond the DataVersions documented in the root README.
 
 ## Host behavior
 
@@ -42,6 +43,11 @@ compatibility with Minecraft or any third-party game.
   framebuffer and cancels active touches, markers, and gestures.
 - `surfaceDestroyed` releases the bitmap and direct buffer after the render
   thread has stopped.
+- Frames render at 0.6x surface resolution into an ARGB_8888 bitmap and are
+  scaled up on draw. Touch coordinates are scaled to match.
+- The status overlay shows world state, chunk/face/triangle counts, and player
+  position. A save is resolved from external files first, then internal app
+  storage (`files/minecraft/world`).
 - If `System.loadLibrary("rkb_android")` fails, the activity shows an error
   screen instead of crashing.
 
@@ -53,6 +59,9 @@ APK contains exactly `lib/arm64-v8a/librkb_android.so` with package
 `com.rkb.rust.MainActivity`. The host test suite also checks the Kotlin
 declarations against the JNI exports.
 
-A physical Android device was not available during the stabilization phase.
-Installation, launch, touch, rotation, and background/foreground behavior still
-need manual device testing.
+A separate workflow boots an API 34 emulator, pushes a synthetic 1.21 save into
+app storage, launches the activity, and asserts from logcat that the client
+loaded the save, streamed chunks, meshed faces, rendered triangles, and presented
+a frame without crashing. A physical Android device was not available, so
+real-hardware touch, rotation, and background/foreground behavior still need
+manual testing.

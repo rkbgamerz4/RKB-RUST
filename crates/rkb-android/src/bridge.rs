@@ -2,13 +2,14 @@
 //!
 //! Kept free of JNI types so it can be unit-tested on the host.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rkb_core::{Stage, Vec2};
 use rkb_input::{TouchEvent, TouchPhase, TouchPoint};
+use rkb_minecraft::MinecraftGame;
 use rkb_platform::{Surface, SurfaceError};
 use rkb_runtime::{FrameReport, Runtime, RuntimeConfig};
-use rkb_sandbox::{bootstrap, Sandbox};
 
 /// Outcome of a native frame request.
 #[derive(Debug)]
@@ -65,34 +66,33 @@ impl Surface for DirectBufferSurface<'_> {
 /// Owns the runtime and converts JNI calls into engine operations.
 #[derive(Debug)]
 pub struct AndroidEngine {
-    runtime: Runtime<Sandbox>,
+    runtime: Runtime<MinecraftGame>,
     width: u32,
     height: u32,
     destroyed: bool,
 }
 
 impl AndroidEngine {
-    pub fn new(width: u32, height: u32) -> Result<Self, String> {
+    pub fn new(width: u32, height: u32, world: Option<PathBuf>) -> Self {
         let width = width.max(1);
         let height = height.max(1);
-        let viewport = Vec2::new(width as f32, height as f32);
-        let booted = bootstrap(viewport).map_err(|error| error.to_string())?;
         let config = RuntimeConfig {
-            engine: booted.engine,
-            clear_color: rkb_render::Color::rgb(16, 22, 36),
+            engine: rkb_core::EngineConfig::default(),
+            // Sky horizon; the client paints its own gradient over it.
+            clear_color: rkb_render::Color::rgb(171, 208, 240),
             // Android copies pixels into a direct buffer; hashing the whole
             // framebuffer every frame would double memory traffic for no host
             // benefit.
             checksum_frames: false,
         };
-        let mut runtime = Runtime::new(config, booted.sandbox, width, height);
-        runtime.start().map_err(|error| error.to_string())?;
-        Ok(Self {
+        let mut runtime = Runtime::new(config, MinecraftGame::new(world), width, height);
+        let _ = runtime.start();
+        Self {
             runtime,
             width,
             height,
             destroyed: false,
-        })
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -163,18 +163,44 @@ impl AndroidEngine {
 
     #[must_use]
     pub fn stats_text(&self) -> String {
-        let stats = self.runtime.game().stats();
+        let game = self.runtime.game();
+        let stats = game.stats();
         let report = self.runtime.last_report();
         format!(
-            "stage={:?} frames={} fps={:.1} balls={} taps={} bursts={} zoom={:.2} cached={}B",
+            "stage={:?} frames={} fps={:.1} world={} chunks={}/{} faces={} tris={} pos=({:.1},{:.1},{:.1}) yaw={:.0} pitch={:.0} fly={} status={}",
             self.runtime.stage(),
             report.frame_index,
             report.fps,
-            stats.balls,
-            stats.taps,
-            stats.bursts,
-            stats.zoom,
-            stats.resources.bytes_cached
+            if stats.world_loaded { "loaded" } else { "unavailable" },
+            stats.chunks_loaded,
+            stats.chunks_loaded + stats.chunks_queued,
+            stats.faces,
+            stats.triangles,
+            stats.position.x,
+            stats.position.y,
+            stats.position.z,
+            stats.yaw.to_degrees(),
+            stats.pitch.to_degrees(),
+            stats.flying,
+            game.status()
+        )
+    }
+
+    /// One-line world state, logged at startup so CI can assert the client is
+    /// actually running and what save it opened.
+    #[must_use]
+    pub fn status_text(&self) -> String {
+        let game = self.runtime.game();
+        format!(
+            "world={} save={} status={}",
+            if game.has_world() {
+                "loaded"
+            } else {
+                "unavailable"
+            },
+            game.world_path()
+                .map_or_else(|| "(none)".to_owned(), |path| path.display().to_string()),
+            game.status()
         )
     }
 }
@@ -236,8 +262,36 @@ mod tests {
     }
 
     #[test]
+    fn engine_reports_minecraft_state_instead_of_sandbox_state() {
+        let mut engine = AndroidEngine::new(160, 90, None);
+        let mut pixels = vec![0_u8; 160 * 90 * 4];
+        engine.frame(&mut pixels, 160, 90, Duration::from_millis(16));
+        let stats = engine.stats_text();
+        assert!(stats.contains("world=unavailable"), "{stats}");
+        assert!(stats.contains("No Minecraft world"), "{stats}");
+        assert!(!stats.contains("balls="), "{stats}");
+        assert!(engine.status_text().contains("world=unavailable"));
+    }
+
+    #[test]
+    fn engine_loads_a_supplied_save() {
+        let dir = rkb_mc::fixture::TempDir::new("android-world");
+        rkb_minecraft::demo_world::write_demo_world(dir.path()).unwrap();
+        let mut engine = AndroidEngine::new(160, 90, Some(dir.path().to_path_buf()));
+        let mut pixels = vec![0_u8; 160 * 90 * 4];
+        assert!(matches!(
+            engine.frame(&mut pixels, 160, 90, Duration::from_millis(16)),
+            EngineFrame::Presented(_)
+        ));
+        let stats = engine.stats_text();
+        assert!(stats.contains("world=loaded"), "{stats}");
+        assert!(stats.contains("RKB Demo Island"), "{stats}");
+        assert!(engine.status_text().contains("world=loaded"));
+    }
+
+    #[test]
     fn engine_renders_and_handles_lifecycle() {
-        let mut engine = AndroidEngine::new(160, 90).unwrap();
+        let mut engine = AndroidEngine::new(160, 90, None);
         let mut pixels = vec![0_u8; 160 * 90 * 4];
         let frame = engine.frame(&mut pixels, 160, 90, Duration::from_millis(16));
         assert!(matches!(frame, EngineFrame::Presented(_)));
@@ -263,7 +317,7 @@ mod tests {
 
     #[test]
     fn engine_rejects_short_buffers() {
-        let mut engine = AndroidEngine::new(64, 64).unwrap();
+        let mut engine = AndroidEngine::new(64, 64, None);
         let mut pixels = vec![0_u8; 16];
         assert!(matches!(
             engine.frame(&mut pixels, 64, 64, Duration::from_millis(16)),
@@ -273,7 +327,7 @@ mod tests {
 
     #[test]
     fn engine_resizes_when_frame_dimensions_change() {
-        let mut engine = AndroidEngine::new(320, 180).unwrap();
+        let mut engine = AndroidEngine::new(320, 180, None);
         let mut pixels = vec![0_u8; 640 * 360 * 4];
         let frame = engine.frame(&mut pixels, 640, 360, Duration::from_millis(16));
         assert!(matches!(frame, EngineFrame::Presented(_)));
@@ -286,7 +340,7 @@ mod tests {
 
     #[test]
     fn engine_accepts_oversized_direct_buffers() {
-        let mut engine = AndroidEngine::new(32, 16).unwrap();
+        let mut engine = AndroidEngine::new(32, 16, None);
         let mut pixels = vec![0_u8; 32 * 16 * 4 + 64];
         assert!(matches!(
             engine.frame(&mut pixels, 32, 16, Duration::from_millis(16)),
@@ -297,7 +351,7 @@ mod tests {
 
     #[test]
     fn engine_destroy_is_idempotent() {
-        let mut engine = AndroidEngine::new(16, 16).unwrap();
+        let mut engine = AndroidEngine::new(16, 16, None);
         engine.destroy();
         engine.destroy();
         let mut pixels = vec![0_u8; 16 * 16 * 4];

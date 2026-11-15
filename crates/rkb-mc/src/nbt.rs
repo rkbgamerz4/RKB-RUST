@@ -78,7 +78,19 @@ impl Tag {
         self.as_compound().and_then(|map| map.get(key))
     }
 
+    /// Mutable field access, for callers composing synthetic saves.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Tag> {
+        self.as_compound_mut().and_then(|map| map.get_mut(key))
+    }
+
     pub fn as_compound(&self) -> Option<&BTreeMap<String, Tag>> {
+        match self {
+            Self::Compound(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    pub fn as_compound_mut(&mut self) -> Option<&mut BTreeMap<String, Tag>> {
         match self {
             Self::Compound(map) => Some(map),
             _ => None,

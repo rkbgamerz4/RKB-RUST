@@ -14,6 +14,7 @@ mod texture;
 pub use color::{Color, ColorError};
 pub use framebuffer::Framebuffer;
 pub use renderer::{
-    Camera2D, DrawCommand, DrawList, RenderBackend, RenderError, RenderStats, SoftwareBackend,
+    project_clip, Camera2D, DrawCommand, DrawList, RenderBackend, RenderError, RenderStats,
+    SoftwareBackend, Vertex3D,
 };
 pub use texture::Texture;

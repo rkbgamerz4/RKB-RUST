@@ -16,9 +16,10 @@ mod bridge;
 
 pub use bridge::{AndroidEngine, DirectBufferSurface};
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use ::jni::objects::{JByteBuffer, JClass};
+use ::jni::objects::{JByteBuffer, JClass, JString};
 use ::jni::sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use ::jni::JNIEnv;
 
@@ -72,27 +73,51 @@ unsafe fn engine_mut<'a>(handle: jlong) -> Option<&'a mut AndroidEngine> {
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "system" fn Java_com_rkb_rust_RkbNative_nativeCreate(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     width: jint,
     height: jint,
+    world_path: jstring,
 ) -> jlong {
     let width = u32::try_from(width.max(1)).unwrap_or(1);
     let height = u32::try_from(height.max(1)).unwrap_or(1);
-    match AndroidEngine::new(width, height) {
-        Ok(engine) => {
-            log(
-                LOG_INFO,
-                &format!("native engine created ({width}x{height})"),
-            );
-            Box::into_raw(Box::new(engine)) as jlong
-        }
-        Err(error) => {
-            log(LOG_ERROR, &format!("native engine failed: {error}"));
-            0
-        }
-    }
+    let world = if world_path.is_null() {
+        None
+    } else {
+        // SAFETY: JNI guarantees a valid local reference for the duration of
+        // this call; we never retain the `JString`.
+        let path = unsafe { JString::from_raw(world_path) };
+        let converted = match env.get_string(&path) {
+            Ok(text) => {
+                let text: String = text.into();
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(text))
+                }
+            }
+            Err(error) => {
+                log(
+                    LOG_ERROR,
+                    &format!("world path is not valid UTF-8: {error}"),
+                );
+                None
+            }
+        };
+        converted
+    };
+    let engine = AndroidEngine::new(width, height, world);
+    log(
+        LOG_INFO,
+        &format!("native engine created ({width}x{height})"),
+    );
+    log(
+        LOG_INFO,
+        &format!("minecraft client: {}", engine.status_text()),
+    );
+    Box::into_raw(Box::new(engine)) as jlong
 }
 
 #[no_mangle]
