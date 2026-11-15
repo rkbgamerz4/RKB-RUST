@@ -39,7 +39,10 @@ class MainActivity : Activity() {
     @Volatile
     private var engineHandle: Long = 0L
 
-    /** User save location. ADB can push a 1.21 world here on debuggable builds. */
+    /**
+     * World location. A user can push a 1.21 save here on debuggable builds;
+     * otherwise the engine generates deterministic terrain on first launch.
+     */
     private val worldDir: File by lazy {
         val external = getExternalFilesDir(null)?.let { File(it, "minecraft/world") }
         val internal = File(filesDir, "minecraft/world")
@@ -106,7 +109,8 @@ class MainActivity : Activity() {
     private fun overlayText(stats: String): String = buildString {
         append(stats)
         append("\nLeft stick: move · Drag: look · JUMP / FLY")
-        append("\nSave: ")
+        append("\nCrosshair: BREAK / PLACE · Autosave every 20s")
+        append("\nWorld: ")
         append(worldDir.absolutePath)
     }
 

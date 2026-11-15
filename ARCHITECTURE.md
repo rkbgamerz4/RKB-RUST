@@ -21,31 +21,39 @@ Kotlin render thread
 
 On the host, `HeadlessSurface` replaces `DirectBufferSurface`; `rkb-demo` uses
 the same `Runtime` with the `rkb-sandbox` scene, and `rkb-minecraft`'s render
-test drives `Runtime<MinecraftGame>` against a generated save.
+tests drive `Runtime<MinecraftGame>` against a synthetic save and against a
+fresh generated world.
 
 `rkb-mc` is the data layer for Minecraft 1.21 saved worlds, and `rkb-minecraft`
-is the client built on it: the Android app now runs `Runtime<MinecraftGame>`,
-which opens a save, streams and meshes chunks around the player, and submits
-depth-tested 3D triangles alongside the 2D HUD.
+is the client built on it: the Android app runs `Runtime<MinecraftGame>`, which
+opens a user save or generates a default world, streams and meshes chunks
+around the player, persists edits, and submits depth-tested 3D triangles
+alongside the 2D HUD.
 
 ## Minecraft client data flow
 
 ```text
-MinecraftGame::new(Some(save_dir))
-  └─ rkb_mc::World::open (level.dat, DataVersion gate)
-       └─ per-chunk: Anvil section -> block-state palette -> block lookup
+MinecraftGame::new(Some(world_dir))
+  ├─ rkb-session.json exists? -> seed/spawn/player/edits
+  ├─ level.dat + no marker?   -> rkb_mc::World::open (DataVersion gate)
+  └─ otherwise                -> TerrainGenerator(seed) -> GeneratedWorld
 MinecraftGame::update
-  ├─ Player::step -> WorldQuery -> World::block_at (collision)
+  ├─ GeneratedWorld::poll (background chunk results)
+  ├─ Player::step -> WorldQuery -> base block + edit overlay (collision)
   └─ ensure_area + load_one (2 chunks/step)
-       └─ build_chunk_mesh: 3x3 neighbourhood, hidden-face culling
+       └─ build_chunk_mesh: 3x3 neighbourhood, hidden-face culling, edits
 MinecraftGame::render
   ├─ Camera::view_projection + Frustum::contains_aabb
   ├─ back-face culling, near-plane clipping -> DrawCommand::Triangle3D
   └─ sky gradient, distance fog, crosshair, joystick/buttons
+MinecraftGame::save (autosave/update; pause/stop/destroy)
+  ├─ rkb-session.json (atomic: seed, spawn, player, edits)
+  └─ generated worlds: level.dat + region/r.X.Z.mca (atomic), marker
 ```
 
-`rkb-mc` remains read-only: the client never writes the save and keeps only the
-chunks near the player in memory.
+Saved region worlds stay read-only on disk; edits live in the RKB edit overlay
+inside `rkb-session.json`. Generated worlds additionally write their resident
+chunks as a normal Anvil save.
 
 ## Crates
 
@@ -121,14 +129,16 @@ dependency:
 - `nbt`: Java NBT read/write, modified UTF-8, gzip/zlib, strict limits.
 - `region`: Anvil `.mca` headers, chunk locations, gzip/zlib/uncompressed
   chunks, and a deterministic `RegionWriter` for synthetic fixtures.
-- `chunk`: 1.21 section parsing, block-state palettes, non-spanning packed
-  values, and world-Y block lookup.
+- `chunk`: 1.21 section parsing and construction, block-state palettes,
+  non-spanning packed values, and world-Y block lookup.
 - `registry`: block-state identities and defaults from a user-supplied,
   version-pinned Mojang `blocks.json` report.
 - `version`: explicit DataVersion descriptors. Only 1.21 (3953) and 1.21.1
   (3955) are marked verified.
 - `world`: validates `level.dat`, opens `region/r.X.Z.mca` on demand, validates
   chunk coordinates and versions, and caches loaded chunks.
+- `save`: atomic `level.dat` and Anvil region writing for RKB-generated worlds.
+- `fixture`: synthetic NBT/region builders used by tests and CI.
 
 `rkb-world` is the inspection CLI (`info`, `block`, `chunk`, `registry`). The
 crate contains no Minecraft assets, jars, or world files. Tests generate their
@@ -169,20 +179,25 @@ do.
 ### `rkb-mc`
 
 Minecraft: Java Edition 1.21 save compatibility, with no Minecraft code or data.
-`nbt` parses modified-UTF-8 NBT, `region` reads Anvil `.mca` files and their zlib
-chunks, `chunk` decodes section palettes and block-state cells, `version` gates
-DataVersions (3953 for 1.21, 3955 for 1.21.1), and `world` exposes `level.dat`,
-spawn, chunk cache, and `block_at`. `fixture` generates synthetic saves for tests.
+`nbt` parses modified-UTF-8 NBT, `region` reads and writes Anvil `.mca` files,
+`chunk` decodes and constructs section palettes and block-state cells, `version`
+gates DataVersions (3953 for 1.21, 3955 for 1.21.1), `world` exposes `level.dat`,
+spawn, chunk cache, and `block_at`, and `save` writes generated worlds
+atomically. `fixture` generates synthetic saves for tests.
 
 ### `rkb-minecraft`
 
 The playable client. `blocks` maps block names to approximate colours and a
-solidity rule, `mesh` builds per-chunk face lists with neighbour culling,
-`camera` provides view/projection, frustum planes, and polygon clipping,
-`player` implements AABB collision, gravity, jumping, and flight, `demo_world`
-writes the synthetic island, and `game` ties them into a `Game`: chunk
-streaming, touch input, scene drawing, and status text. The `rkb-fixture` binary
-writes that island for CI and emulator verification.
+solidity rule, `mesh` builds per-chunk face lists with neighbour culling and an
+`EditMap` overlay, `camera` provides view/projection, frustum planes, and
+polygon clipping, `player` implements AABB collision, gravity, jumping, and
+flight, `interaction` raycasts for break/place, `worldgen` produces deterministic
+seeded terrain on a background worker, `world_source` unifies saves and
+generated data, `session` persists seed/player/edits, `demo_world` writes the
+synthetic island, and `game` ties them into a `Game`: world selection, chunk
+streaming, touch input, block edits, autosave, scene drawing, and status text.
+The `rkb-fixture` binary writes the synthetic island for CI and emulator
+verification.
 
 ### `rkb-android`
 
@@ -199,16 +214,18 @@ writes that island for CI and emulator verification.
 
 Kotlin `MainActivity` owns a single render thread, a direct `ByteBuffer`, an
 `ARGB_8888` bitmap, and a `SurfaceView`. It requests `RGBA_8888` surface format,
-resolves the save directory (external files first, then internal), creates the
+resolves the world directory (external files first, then internal), creates the
 engine on the first frame with that path, forwards lifecycle callbacks (after
 stopping the render thread), queues touch samples for the render thread, and
-copies the presented frame into the bitmap. Rendering happens at 0.6x the
-surface size and the bitmap is scaled up on draw; touch coordinates are scaled
-the same way. A status `TextView` overlays world status, chunk/face/triangle
-counts, and position. The frame clock resets on every thread start, and
-`surfaceDestroyed` releases the bitmap and direct buffer only after the render
-thread has joined. A failed `System.loadLibrary` is captured and rendered as an
-error screen rather than aborting the process.
+copies the presented frame into the bitmap. A user save in that directory is
+opened; an empty directory becomes the default generated world. Rendering
+happens at 0.6x the surface size and the bitmap is scaled up on draw; touch
+coordinates are scaled the same way. A status `TextView` overlays world kind,
+chunk/visibility/face/triangle counts, position, save status, and the control
+help. The frame clock resets on every thread start, and `surfaceDestroyed`
+releases the bitmap and direct buffer only after the render thread has joined.
+A failed `System.loadLibrary` is captured and rendered as an error screen
+rather than aborting the process.
 
 `crates/rkb-android/tests/jni_contract.rs` compares every Kotlin `external fun`
 name, parameter type, and return type against the Rust JNI exports, so contract

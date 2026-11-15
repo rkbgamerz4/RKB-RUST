@@ -1,38 +1,53 @@
-//! The Minecraft client: saved world loading, chunk streaming, first-person
-//! movement, touch controls, and depth-tested block rendering.
+//! The Minecraft client: default generated terrain or a user save, chunk
+//! streaming, first-person movement, touch controls, block interaction, and
+//! depth-tested block rendering.
 //!
 //! Scope of this milestone, stated plainly:
 //!
-//! - Reads a user-supplied Minecraft: Java Edition 1.21 save through `rkb-mc`.
-//! - Renders saved block geometry with flat per-block colours and per-face
-//!   shading. There are no textures, biome tints, lighting, or shadows.
-//! - Supports walking, jumping, creative flight, collision, and touch look.
-//! - Does not implement block breaking/placing, inventory, crafting, mobs,
-//!   survival, or networking.
+//! - Opens a user-supplied 1.21 save, or creates a deterministic generated
+//!   world when no save exists. The generated world is the default game.
+//! - Streams chunks from a region save or a background terrain worker, meshes
+//!   real block data, culls hidden faces, and renders with flat placeholder
+//!   colours (no Mojang textures).
+//! - Supports walking, jumping, collision, creative flight, touch look,
+//!   raycast block breaking and placing, and persistent seed/player/edits.
+//! - Does not implement inventory, crafting, mobs, survival, lighting, or
+//!   multiplayer.
 //!
-//! The client never bundles a world. When no save is present it shows a status
-//! message instead of pretending to have one.
+//! No Minecraft assets, code, or world data are bundled. Generated terrain is
+//! produced entirely by RKB code from a seed.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rkb_core::{Rect, Vec2, Vec3};
+use rkb_core::{Rect, Stage, Vec2, Vec3};
 use rkb_input::{TouchButton, TouchEvent, TouchId, TouchPhase, VirtualJoystick};
-use rkb_mc::{World, WorldError};
+use rkb_mc::{BlockState, World};
 use rkb_render::{Color, DrawList, Vertex3D};
 use rkb_runtime::{Game, UpdateContext};
 
 use crate::camera::Camera;
 use crate::demo_world;
-use crate::mesh::{build_chunk_mesh, is_solid_block, ChunkMesh};
+use crate::interaction::{raycast, RayHit};
+use crate::mesh::{build_chunk_mesh, is_solid_block, ChunkMesh, EditMap};
 use crate::player::{BlockQuery, MoveInput, Player};
+use crate::session::{self, PlayerSnapshot, Session};
+use crate::world_source::{WorldKind, WorldState};
+use crate::worldgen::{DEFAULT_SEED, WORLD_MIN_Y};
 
 /// Chunks are streamed in a square around the player.
 pub const LOAD_RADIUS: i32 = 3;
 /// Chunks meshed per simulation step, to keep frames responsive.
 const MESH_BUDGET: usize = 2;
-/// Chunks beyond this radius are dropped.
+/// Chunks beyond this radius are dropped from memory.
 const RETAIN_RADIUS: i32 = LOAD_RADIUS + 1;
+/// Blocks the player can reach when breaking or placing.
+pub const REACH: f32 = 5.0;
+/// Seconds between automatic saves.
+const AUTOSAVE_SECONDS: f32 = 20.0;
+/// The playable world border used by current Java Edition worlds.
+const WORLD_BORDER: f32 = 29_999_984.0;
 
 const SKY_ZENITH: Color = Color::rgb(58, 108, 196);
 const SKY_HORIZON: Color = Color::rgb(171, 208, 240);
@@ -42,22 +57,31 @@ const HUD_WHITE: Color = Color::rgba(255, 255, 255, 190);
 const HUD_JUMP: Color = Color::rgba(104, 196, 128, 200);
 const HUD_FLY: Color = Color::rgba(240, 196, 92, 210);
 const HUD_DOWN: Color = Color::rgba(104, 156, 226, 210);
+const HUD_BREAK: Color = Color::rgba(226, 112, 92, 210);
+const HUD_PLACE: Color = Color::rgba(126, 190, 226, 210);
 
 /// Snapshot of client state for diagnostics and the Android overlay.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GameStats {
     pub world_loaded: bool,
+    /// Chunks with a resident mesh.
     pub chunks_loaded: usize,
+    /// Chunks generated or known in the source.
+    pub chunks_generated: usize,
+    /// Chunks that passed frustum culling on the last rendered frame.
+    pub chunks_visible: usize,
     pub chunks_queued: usize,
     pub blocks: usize,
     pub faces: usize,
     pub triangles: u32,
+    pub edits: usize,
     pub frames: u64,
     pub flying: bool,
     pub on_ground: bool,
     pub position: Vec3,
     pub yaw: f32,
     pub pitch: f32,
+    pub save_dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,9 +93,10 @@ struct LookDrag {
 /// The playable client.
 #[derive(Debug)]
 pub struct MinecraftGame {
-    world: Option<World>,
+    world: Option<WorldState>,
     world_path: Option<PathBuf>,
     message: String,
+    save_status: String,
     spawn: Vec3,
     player: Player,
     meshes: BTreeMap<(i32, i32), ChunkMesh>,
@@ -82,19 +107,27 @@ pub struct MinecraftGame {
     jump: TouchButton,
     fly: TouchButton,
     descend: TouchButton,
+    break_button: TouchButton,
+    place_button: TouchButton,
     fly_presses: u32,
+    break_presses: u32,
+    place_presses: u32,
     look: Option<LookDrag>,
     frames: u64,
     triangles: u32,
+    visible_chunks: usize,
+    edits: EditMap,
+    save_clock: f32,
+    save_dirty: bool,
     last_error: Option<String>,
 }
 
 impl MinecraftGame {
-    /// Creates a client for an optional save directory.
+    /// Creates a client for an optional world directory.
     ///
-    /// A missing path, an absent `level.dat`, a rejected DataVersion, or an
-    /// I/O error produces an idle client with a readable status message; it
-    /// never panics and never substitutes demo content for a real world.
+    /// `Some(path)` opens a 1.21 save when one exists, otherwise it creates and
+    /// saves a deterministic generated world there. `None` produces an idle
+    /// client with an explanatory status; it never substitutes demo content.
     #[must_use]
     pub fn new(world_path: Option<PathBuf>) -> Self {
         let viewport = Vec2::new(1280.0, 720.0);
@@ -102,6 +135,7 @@ impl MinecraftGame {
             world: None,
             world_path: None,
             message: String::new(),
+            save_status: "not saved yet".to_owned(),
             spawn: Vec3::new(0.5, 80.0, 0.5),
             player: Player::new(Vec3::new(0.5, 80.0, 0.5)),
             meshes: BTreeMap::new(),
@@ -112,39 +146,131 @@ impl MinecraftGame {
             jump: TouchButton::new(Rect::new(1080.0, 560.0, 96.0, 96.0), "JUMP"),
             fly: TouchButton::new(Rect::new(1080.0, 452.0, 96.0, 96.0), "FLY"),
             descend: TouchButton::new(Rect::new(972.0, 560.0, 96.0, 96.0), "DOWN"),
+            break_button: TouchButton::new(Rect::new(864.0, 560.0, 96.0, 96.0), "BREAK"),
+            place_button: TouchButton::new(Rect::new(972.0, 452.0, 96.0, 96.0), "PLACE"),
             fly_presses: 0,
+            break_presses: 0,
+            place_presses: 0,
             look: None,
             frames: 0,
             triangles: 0,
+            visible_chunks: 0,
+            edits: EditMap::new(),
+            save_clock: 0.0,
+            save_dirty: false,
             last_error: None,
         };
         game.layout(viewport);
         match world_path {
-            Some(path) => game.open_world(path),
+            Some(path) => game.open_or_generate(path),
             None => {
-                game.message = "No Minecraft world configured. Copy a 1.21 save to the app's \
-                     minecraft/world directory."
+                game.message = "No Minecraft world configured. The Android host must pass a \
+                     writable world directory."
                     .to_owned();
             }
         }
         game
     }
 
-    /// Loads a save, or records a readable failure.
-    fn open_world(&mut self, path: PathBuf) {
+    fn open_or_generate(&mut self, path: PathBuf) {
         self.world_path = Some(path.clone());
-        match load_world(&path) {
+        if let Err(error) = std::fs::create_dir_all(&path) {
+            self.last_error = Some(error.to_string());
+            self.message = format!(
+                "Could not create world directory {}: {error}",
+                path.display()
+            );
+            return;
+        }
+        let has_level = path.join("level.dat").is_file();
+        let marker = session::is_generated(&path);
+        match session::read(&path) {
+            Ok(Some(state)) => {
+                if let Some(seed) = state.seed {
+                    self.start_generated(seed, Some(state), false);
+                } else if has_level {
+                    self.start_save(&path, Some(state));
+                } else {
+                    self.start_generated(DEFAULT_SEED, Some(state), false);
+                }
+            }
+            Ok(None) => {
+                if has_level && !marker {
+                    self.start_save(&path, None);
+                } else if marker {
+                    // The marker proves this is our generated world. Rebuild
+                    // it rather than opening region files as if they were a
+                    // complete user save.
+                    self.start_generated(DEFAULT_SEED, None, true);
+                } else {
+                    self.start_generated(DEFAULT_SEED, None, false);
+                }
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                if has_level && !marker {
+                    self.start_save(&path, None);
+                } else {
+                    self.start_generated(DEFAULT_SEED, None, true);
+                    self.message = format!(
+                        "World session was unreadable ({error}); regenerated seed \
+                         {DEFAULT_SEED:#x}. Previous edits may be lost."
+                    );
+                }
+            }
+        }
+    }
+
+    fn start_generated(&mut self, seed: u64, state: Option<Session>, recovered: bool) {
+        let generated = crate::worldgen::GeneratedWorld::new(seed);
+        let default_spawn = generated.spawn();
+        let had_state = state.is_some();
+        let session = state.unwrap_or_default();
+        self.spawn = session.spawn.unwrap_or(default_spawn);
+        self.player = player_from(session.player, self.spawn);
+        self.edits = session.edits;
+        let resident = generated.resident_chunks();
+        self.world = Some(WorldState::Generated(generated));
+        if !recovered {
+            self.message = format!(
+                "Generated world seed {seed:#x} ready ({resident} chunks generated). \
+                 Terrain is produced by RKB, not a bundled save."
+            );
+        }
+        self.save_status = "generated world; save pending".to_owned();
+        if !had_state || recovered {
+            self.save_quiet();
+        }
+    }
+
+    fn start_save(&mut self, path: &Path, state: Option<Session>) {
+        match load_world(path) {
             Ok(loaded) => {
                 self.spawn = loaded.spawn;
                 self.player = Player::new(loaded.spawn);
-                self.world = Some(loaded.world);
+                if let Some(state) = state {
+                    if let Some(spawn) = state.spawn {
+                        self.spawn = spawn;
+                    }
+                    if let Some(player) = state.player {
+                        self.player = player_from(Some(player), self.spawn);
+                    }
+                    self.edits = state.edits;
+                }
+                self.world = Some(WorldState::Save(loaded.world, loaded.chunks));
                 self.message = format!(
                     "Minecraft {} save \"{}\" loaded ({} chunks).",
                     loaded.version, loaded.name, loaded.chunks
                 );
+                self.save_status = if self.edits.is_empty() {
+                    "loaded save".to_owned()
+                } else {
+                    format!("loaded save with {} block edits", self.edits.len())
+                };
             }
             Err(error) => {
                 self.message = format!("Minecraft world unavailable: {error}");
+                self.save_status = "no world".to_owned();
             }
         }
     }
@@ -160,21 +286,37 @@ impl MinecraftGame {
         &self.message
     }
 
+    /// `"generated"`, `"save"`, or `"none"`.
+    #[must_use]
+    pub fn world_kind(&self) -> Option<&'static str> {
+        self.world.as_ref().map(WorldState::kind_name)
+    }
+
+    /// Last save result, shown next to gameplay status.
+    #[must_use]
+    pub fn save_status(&self) -> &str {
+        &self.save_status
+    }
+
     #[must_use]
     pub fn stats(&self) -> GameStats {
         GameStats {
             world_loaded: self.world.is_some(),
             chunks_loaded: self.meshes.len(),
+            chunks_generated: self.world.as_ref().map_or(0, WorldState::known_chunks),
+            chunks_visible: self.visible_chunks,
             chunks_queued: self.queue.len(),
             blocks: self.meshes.values().map(|mesh| mesh.non_air_blocks).sum(),
             faces: self.meshes.values().map(ChunkMesh::face_count).sum(),
             triangles: self.triangles,
+            edits: self.edits.len(),
             frames: self.frames,
             flying: self.player.flying,
             on_ground: self.player.on_ground,
             position: self.player.position,
             yaw: self.player.yaw,
             pitch: self.player.pitch,
+            save_dirty: self.save_dirty,
         }
     }
 
@@ -218,6 +360,220 @@ impl MinecraftGame {
         self.viewport
     }
 
+    /// Block at absolute coordinates, including the client edit overlay.
+    pub fn block_at(&mut self, x: i32, y: i32, z: i32) -> Result<Option<BlockState>, String> {
+        if !self.edits.is_empty() {
+            if let Some(state) = self.edits.get(&(x, y, z)) {
+                return Ok(Some(state.clone()));
+            }
+        }
+        self.world
+            .as_mut()
+            .map_or(Ok(None), |world| world.base_block_at(x, y, z))
+    }
+
+    /// Replaces a block in the edit overlay and invalidates affected meshes.
+    ///
+    /// Returns `true` when the world changed. Restoring a cell to its original
+    /// saved value removes the overlay entry instead of growing the file.
+    pub fn set_block(
+        &mut self,
+        position: (i32, i32, i32),
+        state: BlockState,
+    ) -> Result<bool, String> {
+        let base = self
+            .world
+            .as_mut()
+            .map_or(Ok(None), |world| {
+                world.base_block_at(position.0, position.1, position.2)
+            })?
+            .unwrap_or_else(BlockState::air);
+        let current = self
+            .edits
+            .get(&position)
+            .cloned()
+            .unwrap_or_else(|| base.clone());
+        if current == state {
+            return Ok(false);
+        }
+        if base == state {
+            self.edits.remove(&position);
+        } else {
+            self.edits.insert(position, state);
+        }
+        self.save_dirty = true;
+        self.save_status = "unsaved block changes".to_owned();
+        self.refresh_chunk(position.0.div_euclid(16), position.2.div_euclid(16));
+        Ok(true)
+    }
+
+    fn refresh_chunk(&mut self, cx: i32, cz: i32) {
+        let Some(center) = self.center else {
+            return;
+        };
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let key = (cx + dx, cz + dz);
+                if (key.0 - center.0).abs() > LOAD_RADIUS || (key.1 - center.1).abs() > LOAD_RADIUS
+                {
+                    continue;
+                }
+                self.meshes.remove(&key);
+                if !self.queue.contains(&key) {
+                    self.queue.push_front(key);
+                }
+            }
+        }
+    }
+
+    /// The block under the crosshair, if any.
+    pub fn target_block(&mut self) -> Result<Option<RayHit>, String> {
+        let eye = self.player.eye();
+        let direction = self.camera().forward();
+        let mut error = None;
+        let hit = raycast(eye, direction, REACH, |x, y, z| {
+            match self.block_at(x, y, z) {
+                Ok(Some(state)) => {
+                    !state.is_air()
+                        && !matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
+                }
+                Ok(None) => false,
+                Err(cause) => {
+                    if error.is_none() {
+                        error = Some(cause);
+                    }
+                    false
+                }
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(hit)
+    }
+
+    /// Breaks the targeted block. Returns the broken position when it changed.
+    pub fn break_block(&mut self) -> Result<Option<(i32, i32, i32)>, String> {
+        let Some(hit) = self.target_block()? else {
+            self.message = "No block within reach.".to_owned();
+            return Ok(None);
+        };
+        if self.set_block(hit.block, BlockState::air())? {
+            self.message = format!(
+                "Broke block at ({}, {}, {}).",
+                hit.block.0, hit.block.1, hit.block.2
+            );
+            Ok(Some(hit.block))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Places a plank block against the targeted face.
+    pub fn place_block(&mut self) -> Result<Option<(i32, i32, i32)>, String> {
+        let Some(hit) = self.target_block()? else {
+            self.message = "No block within reach.".to_owned();
+            return Ok(None);
+        };
+        let target = hit.previous;
+        if target == hit.block {
+            self.message = "Cannot place a block inside terrain.".to_owned();
+            return Ok(None);
+        }
+        if self.intersects_player(target) {
+            self.message = "Cannot place a block inside the player.".to_owned();
+            return Ok(None);
+        }
+        let current = self.block_at(target.0, target.1, target.2)?;
+        if current.as_ref().is_some_and(|state| !state.is_air()) {
+            self.message = "That space is already occupied.".to_owned();
+            return Ok(None);
+        }
+        if self.set_block(target, BlockState::new("minecraft:oak_planks"))? {
+            self.message = format!(
+                "Placed planks at ({}, {}, {}).",
+                target.0, target.1, target.2
+            );
+            Ok(Some(target))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn intersects_player(&self, block: (i32, i32, i32)) -> bool {
+        const EPSILON: f32 = 0.001;
+        let player_min_x = self.player.position.x - crate::player::PLAYER_WIDTH * 0.5;
+        let player_max_x = self.player.position.x + crate::player::PLAYER_WIDTH * 0.5;
+        let player_min_z = self.player.position.z - crate::player::PLAYER_WIDTH * 0.5;
+        let player_max_z = self.player.position.z + crate::player::PLAYER_WIDTH * 0.5;
+        let player_min_y = self.player.position.y;
+        let player_max_y = self.player.position.y + crate::player::PLAYER_HEIGHT;
+        let (bx, by, bz) = (block.0 as f32, block.1 as f32, block.2 as f32);
+        player_max_x > bx + EPSILON
+            && player_min_x < bx + 1.0 - EPSILON
+            && player_max_y > by + EPSILON
+            && player_min_y < by + 1.0 - EPSILON
+            && player_max_z > bz + EPSILON
+            && player_min_z < bz + 1.0 - EPSILON
+    }
+
+    /// Writes the session and, for generated worlds, region files.
+    pub fn save(&mut self) -> Result<(), String> {
+        let Some(path) = self.world_path.clone() else {
+            return Err("no world directory configured".to_owned());
+        };
+        let Some(world) = self.world.as_ref() else {
+            return Err("no world is loaded".to_owned());
+        };
+        let state = Session {
+            seed: world.seed(),
+            spawn: Some(self.spawn),
+            player: Some(PlayerSnapshot {
+                position: self.player.position,
+                yaw: self.player.yaw,
+                pitch: self.player.pitch,
+                flying: self.player.flying,
+            }),
+            edits: self.edits.clone(),
+        };
+        let saved_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64);
+        session::write(&path, &state, saved_at_ms).map_err(|error| error.to_string())?;
+
+        if let WorldState::Generated(generated) = world {
+            let chunks: Vec<rkb_mc::Chunk> =
+                generated.chunks().map(|chunk| (**chunk).clone()).collect();
+            let level = rkb_mc::save::level_tag(
+                crate::worldgen::DATA_VERSION,
+                "RKB Generated World",
+                [
+                    self.spawn.x.floor() as i32,
+                    self.spawn.y.floor() as i32,
+                    self.spawn.z.floor() as i32,
+                ],
+            );
+            rkb_mc::save::write_world(&path, &level, &chunks).map_err(|error| error.to_string())?;
+            session::mark_generated(&path).map_err(|error| error.to_string())?;
+            self.save_status = format!(
+                "saved {} generated chunks + {} edits",
+                chunks.len(),
+                self.edits.len()
+            );
+        } else {
+            self.save_status = format!("saved {} block edits", self.edits.len());
+        }
+        self.save_dirty = false;
+        Ok(())
+    }
+
+    fn save_quiet(&mut self) {
+        if let Err(error) = self.save() {
+            self.last_error = Some(error.clone());
+            self.save_status = format!("save failed: {error}");
+        }
+    }
+
     fn layout(&mut self, viewport: Vec2) {
         self.viewport = Vec2::new(viewport.x.max(1.0), viewport.y.max(1.0));
         let min = self.viewport.x.min(self.viewport.y);
@@ -229,24 +585,17 @@ impl MinecraftGame {
         );
         let side = radius * 0.95;
         let gap = margin * 0.6;
-        self.jump.set_bounds(Rect::new(
-            self.viewport.x - margin - side,
-            self.viewport.y - margin - side,
-            side,
-            side,
-        ));
-        self.fly.set_bounds(Rect::new(
-            self.viewport.x - margin - side,
-            self.viewport.y - margin - side * 2.0 - gap,
-            side,
-            side,
-        ));
-        self.descend.set_bounds(Rect::new(
-            self.viewport.x - margin - side * 2.0 - gap,
-            self.viewport.y - margin - side,
-            side,
-            side,
-        ));
+        let right = self.viewport.x - margin - side;
+        let bottom = self.viewport.y - margin - side;
+        self.jump.set_bounds(Rect::new(right, bottom, side, side));
+        self.descend
+            .set_bounds(Rect::new(right - side - gap, bottom, side, side));
+        self.break_button
+            .set_bounds(Rect::new(right - (side + gap) * 2.0, bottom, side, side));
+        self.place_button
+            .set_bounds(Rect::new(right, bottom - side - gap, side, side));
+        self.fly
+            .set_bounds(Rect::new(right, bottom - (side + gap) * 2.0, side, side));
     }
 
     fn handle_touch(&mut self, event: TouchEvent) {
@@ -270,6 +619,24 @@ impl MinecraftGame {
             return;
         }
         if self.jump.handle(event) {
+            return;
+        }
+        if self.break_button.handle(event) {
+            if self.break_button.press_count() != self.break_presses {
+                self.break_presses = self.break_button.press_count();
+                if let Err(error) = self.break_block() {
+                    self.message = format!("Break failed: {error}");
+                }
+            }
+            return;
+        }
+        if self.place_button.handle(event) {
+            if self.place_button.press_count() != self.place_presses {
+                self.place_presses = self.place_button.press_count();
+                if let Err(error) = self.place_block() {
+                    self.message = format!("Place failed: {error}");
+                }
+            }
             return;
         }
 
@@ -303,6 +670,8 @@ impl MinecraftGame {
         let Some(world) = self.world.as_mut() else {
             return;
         };
+        let _ = world.poll();
+
         let value = self.joystick.value();
         let input = MoveInput {
             forward: -value.y,
@@ -310,16 +679,25 @@ impl MinecraftGame {
             jump: self.jump.is_pressed(),
             descend: self.player.flying && self.descend.is_pressed(),
         };
-        let mut query = WorldQuery { world, error: None };
+        let mut query = WorldQuery {
+            world,
+            edits: &self.edits,
+            error: None,
+        };
         self.player.step(dt, input, &mut query);
         if let Some(error) = query.error {
             self.last_error = Some(error.clone());
             self.message = format!("Block lookup failed: {error}");
         }
 
-        if self.player.position.y < 16.0 {
+        self.player.position.x = self.player.position.x.clamp(-WORLD_BORDER, WORLD_BORDER);
+        self.player.position.z = self.player.position.z.clamp(-WORLD_BORDER, WORLD_BORDER);
+
+        if self.player.position.y < (WORLD_MIN_Y + 4) as f32 {
             let before = self.player.position;
+            let flying = self.player.flying;
             self.player = Player::new(self.spawn);
+            self.player.flying = flying;
             self.message = format!(
                 "Fell to y={:.0}; respawned at ({:.0}, {:.0}, {:.0}).",
                 before.y, self.spawn.x, self.spawn.y, self.spawn.z
@@ -331,6 +709,12 @@ impl MinecraftGame {
             if !self.load_one() {
                 break;
             }
+        }
+
+        self.save_clock += dt;
+        if self.save_clock >= AUTOSAVE_SECONDS {
+            self.save_clock = 0.0;
+            self.save_quiet();
         }
     }
 
@@ -344,7 +728,10 @@ impl MinecraftGame {
         }
         self.center = Some(center);
         if let Some(world) = self.world.as_mut() {
-            world.clear_cache();
+            if let WorldState::Save(save, _) = world {
+                save.clear_cache();
+            }
+            world.retain_chunks(center, RETAIN_RADIUS + 1);
         }
         self.meshes.retain(|&(cx, cz), _| {
             (cx - center.0).abs() <= RETAIN_RADIUS && (cz - center.1).abs() <= RETAIN_RADIUS
@@ -370,13 +757,25 @@ impl MinecraftGame {
         let Some(world) = self.world.as_mut() else {
             return false;
         };
-        match build_chunk_mesh(world, cx, cz) {
+        let ready = match world.kind() {
+            // A saved world may legitimately be missing neighboring chunks;
+            // mesh it with boundary walls. Generated chunks wait for their
+            // full neighbourhood so no false walls appear at seams.
+            WorldKind::Save => true,
+            WorldKind::Generated => world.neighborhood_ready(cx, cz),
+        };
+        if !ready {
+            self.queue.push_back((cx, cz));
+            return true;
+        }
+        let result = build_chunk_mesh(world, cx, cz, &self.edits);
+        match result {
             Ok(Some(mesh)) => {
                 self.meshes.insert((cx, cz), mesh);
             }
             Ok(None) => {}
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.last_error = Some(error.clone());
                 self.message = format!("Chunk ({cx}, {cz}) failed to load: {error}");
             }
         }
@@ -419,11 +818,13 @@ impl MinecraftGame {
         let eye = camera.position;
         let mut out = [Vertex3D::new(0.0, 0.0, 1.0, 1.0); 8];
         let mut triangles = 0_u32;
+        let mut visible_chunks = 0_usize;
 
         for mesh in self.meshes.values() {
             if mesh.faces.is_empty() || !frustum.contains_aabb(mesh.min, mesh.max) {
                 continue;
             }
+            visible_chunks += 1;
             for face in &mesh.faces {
                 if !face.is_visible_from(eye) {
                     continue;
@@ -443,6 +844,7 @@ impl MinecraftGame {
             }
         }
         self.triangles = triangles;
+        self.visible_chunks = visible_chunks;
     }
 
     fn draw_hud(&self, list: &mut DrawList) {
@@ -463,6 +865,8 @@ impl MinecraftGame {
 
         self.draw_button(list, &self.jump, HUD_JUMP, ButtonIcon::Up);
         self.draw_button(list, &self.fly, HUD_FLY, ButtonIcon::Level);
+        self.draw_button(list, &self.break_button, HUD_BREAK, ButtonIcon::Break);
+        self.draw_button(list, &self.place_button, HUD_PLACE, ButtonIcon::Place);
         if self.player.flying {
             self.draw_button(list, &self.descend, HUD_DOWN, ButtonIcon::Down);
         }
@@ -515,6 +919,36 @@ impl MinecraftGame {
                     HUD_WHITE,
                 );
             }
+            ButtonIcon::Break => {
+                list.rect(
+                    Rect::new(center.x - size, center.y - 1.5, size * 2.0, 3.0),
+                    HUD_WHITE,
+                );
+                // A second, rotated stroke is drawn as a thin stepped line.
+                let mut step = -size;
+                while step < size {
+                    list.rect(
+                        Rect::new(center.x + step, center.y - step - 1.5, 4.0, 4.0),
+                        HUD_WHITE,
+                    );
+                    step += size * 0.28;
+                }
+            }
+            ButtonIcon::Place => {
+                list.stroke_rect(
+                    Rect::new(center.x - size, center.y - size, size * 2.0, size * 2.0),
+                    2.0,
+                    HUD_WHITE,
+                );
+                list.rect(
+                    Rect::new(center.x - size * 0.5, center.y - 1.5, size, 3.0),
+                    HUD_WHITE,
+                );
+                list.rect(
+                    Rect::new(center.x - 1.5, center.y - size * 0.5, 3.0, size),
+                    HUD_WHITE,
+                );
+            }
         }
     }
 }
@@ -524,11 +958,21 @@ enum ButtonIcon {
     Up,
     Down,
     Level,
+    Break,
+    Place,
 }
 
 impl Game for MinecraftGame {
     fn on_resize(&mut self, viewport: Vec2) {
         self.layout(viewport);
+    }
+
+    fn on_stage_change(&mut self, stage: Stage) {
+        if matches!(stage, Stage::Paused | Stage::Stopping | Stage::Destroyed)
+            && self.world.is_some()
+        {
+            self.save_quiet();
+        }
     }
 
     fn on_touch(&mut self, event: TouchEvent) {
@@ -553,23 +997,40 @@ impl Game for MinecraftGame {
 }
 
 struct WorldQuery<'a> {
-    world: &'a mut World,
+    world: &'a mut WorldState,
+    edits: &'a EditMap,
     error: Option<String>,
 }
 
 impl BlockQuery for WorldQuery<'_> {
     fn is_solid(&mut self, x: i32, y: i32, z: i32) -> bool {
-        match self.world.block_at(x, y, z) {
+        if !self.edits.is_empty() {
+            if let Some(state) = self.edits.get(&(x, y, z)) {
+                return !state.is_air() && is_solid_block(state);
+            }
+        }
+        match self.world.base_block_at(x, y, z) {
             Ok(Some(state)) => !state.is_air() && is_solid_block(&state),
             Ok(None) => false,
             Err(error) => {
                 if self.error.is_none() {
-                    self.error = Some(error.to_string());
+                    self.error = Some(error);
                 }
                 false
             }
         }
     }
+}
+
+fn player_from(snapshot: Option<PlayerSnapshot>, spawn: Vec3) -> Player {
+    let Some(snapshot) = snapshot else {
+        return Player::new(spawn);
+    };
+    let mut player = Player::new(snapshot.position);
+    player.yaw = snapshot.yaw.rem_euclid(std::f32::consts::TAU);
+    player.pitch = snapshot.pitch.clamp(-1.553, 1.553);
+    player.flying = snapshot.flying;
+    player
 }
 
 struct LoadedWorld {
@@ -635,13 +1096,13 @@ fn ground_height(world: &mut World, x: i32, z: i32, from: i32) -> Result<Option<
     Ok(None)
 }
 
-fn describe_world_error(path: &Path, error: &WorldError) -> String {
+fn describe_world_error(path: &Path, error: &rkb_mc::WorldError) -> String {
     match error {
-        WorldError::Io { .. } => format!(
+        rkb_mc::WorldError::Io { .. } => format!(
             "no readable save at {} (expected level.dat and region/)",
             path.display()
         ),
-        WorldError::Version(source) => format!("unsupported save version: {source}"),
+        rkb_mc::WorldError::Version(source) => format!("unsupported save version: {source}"),
         other => other.to_string(),
     }
 }
@@ -820,5 +1281,131 @@ mod tests {
             game.update(context(1.0 / 60.0, viewport));
         }
         assert!((game.player.position.y - start).abs() < 0.01);
+    }
+
+    #[test]
+    fn no_save_startup_generates_terrain_with_real_geometry() {
+        let dir = TempDir::new("generated-client");
+        let mut game = MinecraftGame::new(Some(dir.path().to_path_buf()));
+        assert!(game.has_world(), "{}", game.status());
+        assert!(
+            game.status().contains("Generated world seed"),
+            "{}",
+            game.status()
+        );
+        let viewport = Vec2::new(640.0, 360.0);
+        game.on_resize(viewport);
+        for _ in 0..600 {
+            game.update(context(1.0 / 60.0, viewport));
+            if game.stats().chunks_loaded >= 9 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let stats = game.stats();
+        assert!(stats.chunks_loaded >= 9, "{stats:?}");
+        assert!(stats.chunks_generated >= 9, "{stats:?}");
+        assert!(stats.faces > 1_000, "{stats:?}");
+        assert!(stats.blocks > 1_000, "{stats:?}");
+
+        game.set_look(0.0, -1.2);
+        let mut list = DrawList::new(SKY_HORIZON);
+        game.render(&mut list, viewport);
+        assert!(game.stats().triangles > 100, "{:?}", game.stats());
+        assert!(game.stats().chunks_visible > 0, "{:?}", game.stats());
+        assert!(dir.path().join(session::SESSION_FILE).is_file());
+        assert!(dir.path().join("level.dat").is_file());
+    }
+
+    #[test]
+    fn generated_world_saves_and_reloads_seed_player_and_edits() {
+        let dir = TempDir::new("generated-reload");
+        let mut game = MinecraftGame::new(Some(dir.path().to_path_buf()));
+        let seed = game
+            .world
+            .as_ref()
+            .and_then(WorldState::seed)
+            .expect("seed");
+        let spawn = game.spawn();
+        game.set_look(1.0, -0.3);
+        game.player.position = spawn + Vec3::new(1.0, 0.0, 1.0);
+        let target = (
+            spawn.x.floor() as i32,
+            spawn.y.floor() as i32 - 1,
+            spawn.z.floor() as i32,
+        );
+        assert!(game.set_block(target, BlockState::air()).unwrap());
+        game.save().unwrap();
+        let viewport = Vec2::new(640.0, 360.0);
+        game.on_resize(viewport);
+
+        let mut reopened = MinecraftGame::new(Some(dir.path().to_path_buf()));
+        assert!(reopened.has_world(), "{}", reopened.status());
+        assert!(reopened.status().contains("Generated world seed"));
+        assert_eq!(
+            reopened.world.as_ref().and_then(WorldState::seed),
+            Some(seed)
+        );
+        assert!((reopened.player.yaw - 1.0).abs() < 0.001);
+        assert!((reopened.player.position.x - game.player.position.x).abs() < 0.001);
+        assert!(reopened.stats().edits >= 1, "{:?}", reopened.stats());
+        assert_eq!(
+            reopened.block_at(target.0, target.1, target.2).unwrap(),
+            Some(BlockState::air())
+        );
+    }
+
+    #[test]
+    fn break_and_place_round_trip_through_the_crosshair() {
+        let dir = TempDir::new("interaction-client");
+        let mut game = MinecraftGame::new(Some(dir.path().to_path_buf()));
+        let viewport = Vec2::new(640.0, 360.0);
+        game.on_resize(viewport);
+        for _ in 0..40 {
+            game.update(context(1.0 / 60.0, viewport));
+        }
+        let spawn = game.spawn();
+        game.teleport(spawn);
+        game.set_look(0.0, -1.5);
+        for _ in 0..8 {
+            game.update(context(1.0 / 60.0, viewport));
+        }
+        let hit = game.target_block().unwrap().expect("ground underfoot");
+        let before = game
+            .block_at(hit.block.0, hit.block.1, hit.block.2)
+            .unwrap();
+        assert!(before.is_some_and(|state| !state.is_air()));
+        let broken = game.break_block().unwrap().expect("break target");
+        assert_eq!(broken, hit.block);
+        assert_eq!(
+            game.block_at(broken.0, broken.1, broken.2).unwrap(),
+            Some(BlockState::air())
+        );
+        // Look at the newly exposed neighbour and place the block back.
+        game.teleport(spawn);
+        game.set_look(0.0, -1.5);
+        let placed = game.place_block().unwrap().expect("place a block");
+        assert_eq!(
+            game.block_at(placed.0, placed.1, placed.2).unwrap(),
+            Some(BlockState::new("minecraft:oak_planks"))
+        );
+        assert!(game.stats().edits >= 1);
+    }
+
+    #[test]
+    fn generated_world_does_not_overwrite_a_user_save() {
+        let dir = TempDir::new("user-save-priority");
+        demo_world::write_demo_world(dir.path()).unwrap();
+        let game = MinecraftGame::new(Some(dir.path().to_path_buf()));
+        assert!(game.has_world(), "{}", game.status());
+        assert!(
+            game.status().contains("RKB Demo Island"),
+            "{}",
+            game.status()
+        );
+        assert_eq!(
+            game.world.as_ref().map(WorldState::kind),
+            Some(WorldKind::Save)
+        );
     }
 }

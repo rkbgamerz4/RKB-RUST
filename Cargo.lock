@@ -199,6 +199,7 @@ dependencies = [
  "rkb-platform",
  "rkb-render",
  "rkb-runtime",
+ "serde_json",
 ]
 
 [[package]]

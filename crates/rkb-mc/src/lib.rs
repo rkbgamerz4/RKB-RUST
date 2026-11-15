@@ -24,6 +24,7 @@ pub mod fixture;
 pub mod nbt;
 pub mod region;
 pub mod registry;
+pub mod save;
 pub mod version;
 pub mod world;
 
@@ -31,6 +32,7 @@ pub use chunk::{BlockState, Chunk, Section};
 pub use nbt::{Nbt, Tag};
 pub use region::{Compression, RegionFile};
 pub use registry::{BlockRegistry, RegistryError};
+pub use save::{write_world, SaveError};
 pub use version::{VersionError, VersionSpec, VersionStatus, Versions};
 pub use world::{LevelInfo, OpenOptions, World, WorldError};
 

@@ -1,11 +1,32 @@
 # Minecraft: Java Edition 1.21 data support
 
-RKB RUST's first Minecraft subsystem reads saved Java Edition 1.21 world data.
-It is implemented in `crates/rkb-mc` and exposed through the `rkb-world` tool.
-It reads only files supplied by the user; no Minecraft code, assets, or data are
-bundled.
+RKB RUST's Minecraft subsystem reads saved Java Edition 1.21 world data, writes
+RKB-generated worlds back in the same Anvil layout, and runs a playable client
+on that data. The data layer is implemented in `crates/rkb-mc` and exposed
+through the `rkb-world` tool; the client is `crates/rkb-minecraft`. It reads and
+writes only files supplied by or created for the user; no Minecraft code,
+assets, or data are bundled.
 
-## Verified versions
+## Compatibility matrix
+
+The saved-data table below records what the reader and writer accept. The client
+matrix records what has actually been exercised. A version is never marked
+supported just because its number is known.
+
+| Minecraft | DataVersion | Save read | Generated default | Edit overlay | Session write | Region write | Evidence |
+| --- | ---: | --- | --- | --- | --- | --- | --- |
+| 1.21 | 3953 | Verified | Yes (RKB terrain) | Yes | Yes (atomic) | Yes (atomic) | Host tests; emulator fresh-install + synthetic save |
+| 1.21.1 | 3955 | Verified | Yes (RKB terrain) | Yes | Yes (atomic) | Yes (atomic) | Host tests only |
+| 1.21.2–1.21.8 | 4080–4440 | Rejected | n/a | n/a | n/a | n/a | Explicit unsupported version |
+| Older / newer | any other | Rejected | n/a | n/a | n/a | n/a | Explicit unsupported version |
+
+"Generated default" means the client can create terrain from an RKB seed when no
+save exists; it is **not** Mojang's world generator and does not reproduce
+vanilla seeds, structures, or biomes exactly. Region write applies to
+RKB-generated worlds, not to a user save: edits to a user save live in the
+`rkb-session.json` overlay.
+
+## Verified save versions
 
 A version is **verified** only when its constants and the saved format this
 crate parses are covered by tests. The save's `DataVersion` is authoritative;
@@ -148,6 +169,55 @@ palette length. A one-entry palette has no `data` array. These rules are tested
 at 4, 5, and larger bit widths, including the 15/16 cell boundary where a naive
 spanning decoder fails.
 
+## Generated worlds and the RKB session
+
+When the client starts in an empty world directory it creates generated terrain
+instead of showing an empty sky. The terrain is RKB code, produced only from a
+seed:
+
+- value-noise height and climate fields at several scales;
+- biomes selected per column (plains, forest, desert, snowy, ocean);
+- bedrock floor, stone/dirt filler, grass/sand/snow surfaces, water to sea
+  level, gravel sea-floor variation, cacti, and oak trees that can cross chunk
+  boundaries;
+- chunk sections built in memory with real palettes and serialized exactly like
+  a 1.21 chunk.
+
+A 3x3 chunk area around spawn is generated eagerly; remaining chunks are
+requested from one background `rkb-chunk-gen` thread and meshed only after the
+full 3x3 neighbourhood exists, which prevents false walls at seams. Chunks
+outside a retention square are dropped and regenerate deterministically if the
+player returns.
+
+The seed, spawn, player pose, and edit overlay are stored beside the save in
+`rkb-session.json`:
+
+```json
+{
+  "format": 1,
+  "saved_at": 1760000000000,
+  "seed": 735000000000000001,
+  "spawn": [0.5, 67.0, 0.5],
+  "player": {
+    "position": [0.5, 67.0, 0.5],
+    "yaw": 0.0,
+    "pitch": 0.0,
+    "flying": false
+  },
+  "edits": [[4, 66, 5, "minecraft:oak_planks", {}]]
+}
+```
+
+`rkb-generated-world` is a marker file. A directory with `level.dat` but neither
+marker nor session is treated as a user save. Generated worlds additionally
+write `level.dat` and `region/r.X.Z.mca` from resident chunks, so the
+`rkb-world` reader can reopen the block data. These chunks omit biomes,
+heightmaps, and lighting, so the writer is not yet a drop-in vanilla save
+exporter. All writes go through a temporary sibling and an atomic rename; a
+crash leaves either the old complete file or the new one. A corrupt or
+future-format session is reported and recovered by regenerating the default
+seed rather than being silently ignored.
+
 ## Implemented API
 
 ### `rkb_mc::nbt`
@@ -175,8 +245,10 @@ spanning decoder fails.
 ### `rkb_mc::chunk`
 
 - `BlockState { name, properties }`, `Display`, NBT round-trip, air detection.
-- `Section` palette/storage parsing and local block lookup.
-- `Chunk::parse`, section iteration, world-Y lookup, non-air count.
+- `Section` palette/storage parsing, construction (`new`, `filled`,
+  `set_block`, `cells`, `to_nbt`), and local block lookup.
+- `Chunk::parse`, `Chunk::new`, `set_block`, `to_nbt`, section iteration,
+  world-Y lookup, non-air count.
 - Rejection of empty/oversized palettes, missing storage, wrong storage length,
   out-of-range indices, duplicate section Y values, and malformed entries.
 
@@ -203,8 +275,33 @@ spanning decoder fails.
 - Requires each chunk's DataVersion to be supported.
 - Rejects a chunk whose `xPos`/`zPos` do not match its slot.
 - Caches loaded chunks; region headers are reopened per miss, which keeps file
-  descriptors bounded and is adequate for inspection. A gameplay renderer will
-  need a region cache and asynchronous loading.
+  descriptors bounded and is adequate for inspection. The client clears the
+  cache when the player crosses a chunk boundary.
+
+### `rkb_mc::save`
+
+- `write_atomic(path, bytes)` with a same-directory temporary file.
+- `level_tag`, `write_level`, `write_world` for `level.dat` + Anvil regions.
+- `SaveError` with the failing path in every message.
+- Tests reopen a written world with `World::open` and check that no temporary
+  files remain after replacement.
+
+### `rkb_minecraft` client modules
+
+- `worldgen`: `TerrainGenerator`, `Biome`, `GeneratedWorld`, `DEFAULT_SEED`,
+  `SEA_LEVEL`, `WORLD_MIN_Y`/`WORLD_MAX_Y`; deterministic generation, spawn
+  search, background worker, retention, and generated-world save tests.
+- `world_source`: `WorldState::{Save, Generated}`, `WorldKind`, `ChunkSource`,
+  block lookup, 3x3 neighbourhood readiness, and generated chunk cloning.
+- `session`: `rkb-session.json` format 1, atomic write, corruption/format errors,
+  generated marker, and round-trip tests.
+- `mesh`: `EditMap` overlay, edit-aware face culling/colour/counts, and
+  generated blocks above stored sections.
+- `interaction`: Amanatides-Woo voxel raycast returning the hit block and the
+  placement face, with reach and negative-axis tests.
+- `game`: world selection, spawn/player restore, background polling, accurate
+  stats, autosave, break/place rules, player-intersection rejection, and HUD
+  buttons.
 
 ## `rkb-world` CLI
 
@@ -273,11 +370,14 @@ must read user-supplied packs only.
 
 ### 2. World and chunk loading
 
-Done: on-demand region/chunk reads, section lookup, chunk identity validation.
+Done: on-demand region/chunk reads, section lookup, chunk identity validation,
+a deterministic RKB terrain generator, a 3x3 spawn neighbourhood, one background
+generation worker, deterministic regeneration after retention eviction, session
+persistence, and writing generated worlds as `level.dat` + Anvil regions.
 
-Next: async/background loading, a bounded region/chunk cache, biomes,
-heightmaps, block entities, entities, structures, and save writing. Datafixers
-are required before opening worlds older than the supported DataVersion.
+Next: named seeds, structures, caves/ores, biomes with real climate tables,
+entities, and a bounded region/chunk cache. Datafixers are required before
+opening worlds older than the supported DataVersion.
 
 ### 3. Block states
 
@@ -288,11 +388,12 @@ property enums/integers, and block behaviour tables.
 
 ### 4. Terrain rendering
 
-Data support is done: `rkb-minecraft` streams chunks, meshes exposed block faces
-with neighbour culling, frustum-culls chunk bounds, and renders blocks through
-the software renderer's depth-tested 3D triangle path. Every non-air block is
-treated as a full cube with a flat approximate colour and per-face shading;
-there is no texture atlas, lightmap, block model, or shape support.
+`rkb-minecraft` streams chunks from either a save or the generated world, meshes
+exposed block faces with neighbour culling, frustum-culls chunk bounds, and
+renders blocks through the software renderer's depth-tested 3D triangle path.
+Every non-air block is treated as a full cube with a flat approximate colour and
+per-face shading; there is no texture atlas, lightmap, block model, or shape
+support.
 
 Next: texture atlas from a user's resource pack, transparent and non-cube block
 models (slabs, stairs, fences), lightmap sampling, and memory/frame budgets for
@@ -310,10 +411,14 @@ sprinting/sneaking, and movement on the Android touch layout.
 
 ### 6. Block breaking and placing
 
-Not implemented.
+Implemented: a 5-block DDA raycast, first-hit selection, **BREAK** to remove a
+block, **PLACE** to put oak planks on the targeted face, player-intersection
+rejection, edit-aware mesh refresh, and persistence in `rkb-session.json`.
+Break/place works on generated worlds and on read-only user saves through the
+client edit overlay.
 
-Next: reach/raycast, block hardness and tool rules, break progress, placement
-rules, block updates, drops, and creative/survival differences.
+Next: block hardness and tool rules, break progress, placement rules beyond the
+player box, block updates, drops, and creative/survival differences.
 
 ### 7. Inventory and hotbar
 
@@ -342,32 +447,44 @@ Not implemented.
 
 Next: health, hunger, damage, respawn, experience, and the survival HUD.
 
-## Limitations of the first milestone
+## Limitations of the current milestone
 
-- Read-only save inspection. `RegionWriter` exists for synthetic fixtures and
-  tools, not a general save writer.
+- User saves are still treated as read-only terrain: edits live in the
+  `rkb-session.json` overlay rather than being written into the user's region
+  files. Generated worlds do write `level.dat` and region files.
 - no LZ4 region compression;
 - no datafixers, so only DataVersions 3953 and 3955 are accepted;
-- biomes, heightmaps, block entities, entities, structures, and lighting are
-  ignored;
+- generated terrain is RKB terrain: it does not reproduce vanilla seeds,
+  structures, caves, ores, or exact biome placement;
+- biomes, heightmaps, block entities, entities, structures, and lighting in a
+  user save are ignored;
 - the registry is not bundled and is only used by the `registry` command, not
   yet to validate every palette entry;
 - the client treats every block as a full cube with an approximate flat colour:
   no textures, resource packs, biome tints, lighting, shadows, or partial-block
   shapes (slabs, stairs, fences, and similar blocks render and collide as cubes);
-- block breaking/placing, inventory, crafting, mobs, survival, and networking
-  are not implemented;
-- the emulator workflow verifies world loading and block rendering against a
-  synthetic save. A physical Android device was not available, so real-hardware
-  touch and performance remain unverified.
+- placing always produces oak planks, and block hardness/tools/drops are not
+  modeled;
+- inventory, crafting, mobs, survival, and networking are not implemented;
+- the emulator workflow verifies both a fresh generated-world startup and a
+  synthetic supplied-save startup. A physical Android device was not available,
+  so real-hardware touch, thermals, and performance remain unverified.
 
 ## Tests
 
-`cargo test -p rkb-mc --all-targets --locked` runs:
+`cargo test --workspace` currently runs 199 unit/integration tests, including:
 
-- 41 unit tests inside the library;
-- 6 CLI integration tests that build synthetic saves and run the binary.
+- 41 `rkb-mc` unit tests plus 6 CLI integration tests that build synthetic
+  saves and run the binary;
+- `rkb-minecraft` tests for generated terrain determinism, surface and spawn
+  correctness, background chunk delivery, save/reopen, edit-aware meshing,
+  raycast reach, generated startup stats, session round-trip, and break/place;
+- `rkb-android` host tests that create an engine with no save and assert
+  generated terrain, persisted `level.dat`/`rkb-session.json`, and rendered
+  faces;
+- end-to-end `Runtime<MinecraftGame>` renders for both a synthetic save and a
+  fresh generated world.
 
 Synthetic fixtures contain only generated NBT and region bytes. No Mojang data
-is stored. CI also compiles `rkb-mc` for `aarch64-linux-android` in both the Rust
+is stored. CI also compiles both crates for `aarch64-linux-android` in the Rust
 and Android workflows.

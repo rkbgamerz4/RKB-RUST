@@ -89,12 +89,19 @@ jobs:
           name: rkb-emulator-startup
           path: |
             emulator-logcat.txt
+            emulator-logcat-generated.txt
             emulator-activities.txt
             emulator-activities-late.txt
+            emulator-activities-generated.txt
+            emulator-activities-generated-late.txt
             emulator-ps.txt
+            emulator-ps-generated.txt
             emulator-pidof.txt
+            emulator-pidof-generated.txt
             emulator-screen.png
             emulator-screen-late.png
+            emulator-screen-generated.png
+            emulator-screen-generated-late.png
             android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
           retention-days: 14

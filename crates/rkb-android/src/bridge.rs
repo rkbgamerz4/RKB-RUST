@@ -167,32 +167,37 @@ impl AndroidEngine {
         let stats = game.stats();
         let report = self.runtime.last_report();
         format!(
-            "stage={:?} frames={} fps={:.1} world={} chunks={}/{} faces={} tris={} pos=({:.1},{:.1},{:.1}) yaw={:.0} pitch={:.0} fly={} status={}",
+            "stage={:?} frames={} fps={:.1} world={} kind={} chunks={}/{} visible={} faces={} tris={} blocks={} edits={} pos=({:.1},{:.1},{:.1}) yaw={:.0} pitch={:.0} fly={} save={} status={}",
             self.runtime.stage(),
             report.frame_index,
             report.fps,
             if stats.world_loaded { "loaded" } else { "unavailable" },
+            game.world_kind().unwrap_or("none"),
             stats.chunks_loaded,
-            stats.chunks_loaded + stats.chunks_queued,
+            stats.chunks_generated,
+            stats.chunks_visible,
             stats.faces,
             stats.triangles,
+            stats.blocks,
+            stats.edits,
             stats.position.x,
             stats.position.y,
             stats.position.z,
             stats.yaw.to_degrees(),
             stats.pitch.to_degrees(),
             stats.flying,
+            game.save_status(),
             game.status()
         )
     }
 
     /// One-line world state, logged at startup so CI can assert the client is
-    /// actually running and what save it opened.
+    /// actually running and what world it opened.
     #[must_use]
     pub fn status_text(&self) -> String {
         let game = self.runtime.game();
         format!(
-            "world={} save={} status={}",
+            "world={} save={} status={} save_status={}",
             if game.has_world() {
                 "loaded"
             } else {
@@ -200,7 +205,8 @@ impl AndroidEngine {
             },
             game.world_path()
                 .map_or_else(|| "(none)".to_owned(), |path| path.display().to_string()),
-            game.status()
+            game.status(),
+            game.save_status()
         )
     }
 }
@@ -287,6 +293,42 @@ mod tests {
         assert!(stats.contains("world=loaded"), "{stats}");
         assert!(stats.contains("RKB Demo Island"), "{stats}");
         assert!(engine.status_text().contains("world=loaded"));
+    }
+
+    #[test]
+    fn engine_generates_terrain_when_no_save_exists() {
+        let dir = rkb_mc::fixture::TempDir::new("android-generated");
+        let mut engine = AndroidEngine::new(160, 90, Some(dir.path().to_path_buf()));
+        let mut pixels = vec![0_u8; 160 * 90 * 4];
+        for _ in 0..120 {
+            assert!(matches!(
+                engine.frame(&mut pixels, 160, 90, Duration::from_millis(16)),
+                EngineFrame::Presented(_)
+            ));
+            // Give the background generator real time between updates.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let stats = engine.stats_text();
+        assert!(stats.contains("world=loaded"), "{stats}");
+        assert!(stats.contains("kind=generated"), "{stats}");
+        assert!(stats.contains("Generated world seed"), "{stats}");
+        let chunks: usize = stats
+            .split("chunks=")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        assert!(chunks >= 1, "{stats}");
+        let faces: usize = stats
+            .split("faces=")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        assert!(faces > 0, "{stats}");
+        assert!(engine.status_text().contains("world=loaded"));
+        assert!(dir.path().join("level.dat").is_file());
+        assert!(dir.path().join("rkb-session.json").is_file());
     }
 
     #[test]

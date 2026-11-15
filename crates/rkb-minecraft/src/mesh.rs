@@ -5,13 +5,19 @@
 //! three-dimensional world. This is a deliberate first step: it renders real
 //! saved block data without pretending to have the resource pack pipeline.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rkb_core::Vec3;
-use rkb_mc::{BlockState, Chunk, World, WorldError};
+use rkb_mc::{BlockState, Chunk};
 use rkb_render::Color;
 
 use crate::blocks::{block_color, is_solid};
+use crate::world_source::ChunkSource;
+use crate::worldgen::{WORLD_MAX_Y, WORLD_MIN_Y};
+
+/// Absolute block edits layered over a world source.
+pub type EditMap = BTreeMap<(i32, i32, i32), BlockState>;
 
 /// One outward-facing block face in world space.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,7 +73,20 @@ fn neighbor_index(cx: i32, cz: i32, wx: i32, wz: i32) -> Option<usize> {
     Some(((dz + 1) * 3 + (dx + 1)) as usize)
 }
 
-fn is_air_at(neighbors: &Neighborhood, cx: i32, cz: i32, x: i32, y: i32, z: i32) -> bool {
+fn is_air_at(
+    neighbors: &Neighborhood,
+    edits: &EditMap,
+    cx: i32,
+    cz: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    if !edits.is_empty() {
+        if let Some(state) = edits.get(&(x, y, z)) {
+            return state.is_air();
+        }
+    }
     let Some(index) = neighbor_index(cx, cz, x, z) else {
         return true;
     };
@@ -85,18 +104,19 @@ fn is_air_at(neighbors: &Neighborhood, cx: i32, cz: i32, x: i32, y: i32, z: i32)
 /// boundaries are resolved through the surrounding 3x3 chunk neighbourhood so
 /// no internal wall is drawn at a chunk edge.
 pub fn build_chunk_mesh(
-    world: &mut World,
+    source: &mut dyn ChunkSource,
     cx: i32,
     cz: i32,
-) -> Result<Option<ChunkMesh>, WorldError> {
-    let Some(chunk) = world.chunk(cx, cz)? else {
+    edits: &EditMap,
+) -> Result<Option<ChunkMesh>, String> {
+    let Some(chunk) = source.chunk(cx, cz)? else {
         return Ok(None);
     };
     let mut neighbors: Neighborhood = Default::default();
     for dz in -1..=1 {
         for dx in -1..=1 {
             let index = ((dz + 1) * 3 + (dx + 1)) as usize;
-            neighbors[index] = world.chunk(cx + dx, cz + dz)?;
+            neighbors[index] = source.chunk(cx + dx, cz + dz)?;
         }
     }
 
@@ -119,18 +139,60 @@ pub fn build_chunk_mesh(
                     let Some(state) = section.block_at(x, y, z) else {
                         continue;
                     };
-                    if state.is_air() {
-                        continue;
-                    }
-                    mesh.non_air_blocks += 1;
                     let wx = cx * 16 + x as i32;
                     let wy = section_y + y as i32;
                     let wz = cz * 16 + z as i32;
-                    let color = block_color(&state.name);
-                    emit_face(&mut mesh.faces, &neighbors, cx, cz, wx, wy, wz, color);
+                    let effective = if edits.is_empty() {
+                        state
+                    } else {
+                        edits.get(&(wx, wy, wz)).unwrap_or(state)
+                    };
+                    if effective.is_air() {
+                        continue;
+                    }
+                    mesh.non_air_blocks += 1;
+                    let color = block_color(&effective.name);
+                    emit_face(
+                        &mut mesh.faces,
+                        &neighbors,
+                        edits,
+                        cx,
+                        cz,
+                        wx,
+                        wy,
+                        wz,
+                        color,
+                    );
                 }
             }
         }
+    }
+
+    // Edits can add blocks above the highest saved section. Those cells have
+    // no section to iterate, so emit them directly.
+    for (&(wx, wy, wz), state) in edits {
+        if wx.div_euclid(16) != cx || wz.div_euclid(16) != cz || state.is_air() {
+            continue;
+        }
+        let section_y = i8::try_from(wy.div_euclid(16)).ok();
+        if section_y.is_some_and(|y| chunk.section(y).is_some()) {
+            continue;
+        }
+        if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&wy) {
+            continue;
+        }
+        mesh.non_air_blocks += 1;
+        emit_face(
+            &mut mesh.faces,
+            &neighbors,
+            edits,
+            cx,
+            cz,
+            wx,
+            wy,
+            wz,
+            block_color(&state.name),
+        );
     }
 
     if mesh.faces.is_empty() {
@@ -148,6 +210,7 @@ pub fn build_chunk_mesh(
 fn emit_face(
     faces: &mut Vec<Face>,
     neighbors: &Neighborhood,
+    edits: &EditMap,
     cx: i32,
     cz: i32,
     wx: i32,
@@ -227,7 +290,7 @@ fn emit_face(
     ];
 
     for ((dx, dy, dz), normal, corners, shade) in directions {
-        if !is_air_at(neighbors, cx, cz, wx + dx, wy + dy, wz + dz) {
+        if !is_air_at(neighbors, edits, cx, cz, wx + dx, wy + dy, wz + dz) {
             continue;
         }
         faces.push(Face {
@@ -270,6 +333,7 @@ mod tests {
     use super::*;
     use rkb_mc::chunk::SECTION_VOLUME;
     use rkb_mc::fixture::{chunk_tag, level_tag, section_tag, write_world, TempDir};
+    use rkb_mc::World;
 
     fn stone_section() -> rkb_mc::Tag {
         section_tag(
@@ -285,7 +349,9 @@ mod tests {
         let chunks = [(0, 0, chunk_tag(3953, 0, 0, vec![stone_section()]))];
         write_world(dir.path(), &level_tag(3953, "Mesh"), &chunks).unwrap();
         let mut world = World::open(dir.path()).unwrap();
-        let mesh = build_chunk_mesh(&mut world, 0, 0).unwrap().unwrap();
+        let mesh = build_chunk_mesh(&mut world, 0, 0, &EditMap::new())
+            .unwrap()
+            .unwrap();
 
         // A lone solid chunk exposes all six outer walls: 6 * 16 * 16 quads.
         assert_eq!(mesh.face_count(), 6 * 256);
@@ -303,7 +369,9 @@ mod tests {
         ];
         write_world(dir.path(), &level_tag(3953, "Mesh"), &chunks).unwrap();
         let mut world = World::open(dir.path()).unwrap();
-        let mesh = build_chunk_mesh(&mut world, 0, 0).unwrap().unwrap();
+        let mesh = build_chunk_mesh(&mut world, 0, 0, &EditMap::new())
+            .unwrap()
+            .unwrap();
 
         let internal = mesh
             .faces
@@ -320,12 +388,40 @@ mod tests {
         let chunks = [(0, 0, chunk_tag(3953, 0, 0, vec![stone_section()]))];
         write_world(dir.path(), &level_tag(3953, "Mesh"), &chunks).unwrap();
         let mut world = World::open(dir.path()).unwrap();
-        let mesh = build_chunk_mesh(&mut world, 0, 0).unwrap().unwrap();
+        let mesh = build_chunk_mesh(&mut world, 0, 0, &EditMap::new())
+            .unwrap()
+            .unwrap();
         let wall = mesh
             .faces
             .iter()
             .filter(|face| face.normal.x.abs() > 0.9)
             .count();
         assert_eq!(wall, 2 * 256);
+    }
+
+    #[test]
+    fn edits_change_meshed_geometry_and_block_counts() {
+        let dir = TempDir::new("mesh-edits");
+        let chunks = [(0, 0, chunk_tag(3953, 0, 0, vec![stone_section()]))];
+        write_world(dir.path(), &level_tag(3953, "Mesh"), &chunks).unwrap();
+        let mut world = World::open(dir.path()).unwrap();
+        let base = build_chunk_mesh(&mut world, 0, 0, &EditMap::new())
+            .unwrap()
+            .unwrap();
+
+        let mut edits = EditMap::new();
+        edits.insert((8, 64, 8), BlockState::new("minecraft:oak_planks"));
+        let placed = build_chunk_mesh(&mut world, 0, 0, &edits).unwrap().unwrap();
+        assert_eq!(placed.face_count(), base.face_count() + 4);
+        assert_eq!(placed.non_air_blocks, base.non_air_blocks + 1);
+        assert!(placed
+            .faces
+            .iter()
+            .any(|face| face.color != base.faces[0].color));
+
+        edits.insert((8, 64, 8), BlockState::air());
+        let removed = build_chunk_mesh(&mut world, 0, 0, &edits).unwrap().unwrap();
+        assert_eq!(removed.face_count(), base.face_count());
+        assert_eq!(removed.non_air_blocks, base.non_air_blocks);
     }
 }

@@ -36,6 +36,11 @@ impl BlockState {
         }
     }
 
+    /// The canonical air state.
+    pub fn air() -> Self {
+        Self::new("minecraft:air")
+    }
+
     /// Adds one property, returning `self` for chaining.
     pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.properties.insert(key.into(), value.into());
@@ -213,6 +218,88 @@ impl Section {
         }
         Some(self.cells[(y << 8) | (z << 4) | x])
     }
+
+    /// Builds a section from a palette and one index per cell.
+    ///
+    /// This is the in-memory constructor used by terrain generation. The
+    /// palette and cell count are checked so a generated section can never be
+    /// converted into an invalid save.
+    pub fn new(y: i8, palette: Vec<BlockState>, cells: Vec<u16>) -> Self {
+        assert!(!palette.is_empty(), "section palette must not be empty");
+        assert_eq!(cells.len(), SECTION_VOLUME, "section cell count");
+        assert!(
+            cells
+                .iter()
+                .all(|&index| usize::from(index) < palette.len()),
+            "section cell references a missing palette entry"
+        );
+        Self { y, palette, cells }
+    }
+
+    /// A section completely filled with one state.
+    #[must_use]
+    pub fn filled(y: i8, state: BlockState) -> Self {
+        Self {
+            y,
+            palette: vec![state],
+            cells: vec![0; SECTION_VOLUME],
+        }
+    }
+
+    /// The raw cell indices, in `(y << 8) | (z << 4) | x` order.
+    #[must_use]
+    pub fn cells(&self) -> &[u16] {
+        &self.cells
+    }
+
+    /// Replaces one local cell, extending the palette when needed.
+    pub fn set_block(&mut self, x: usize, y: usize, z: usize, state: BlockState) {
+        if x >= SECTION_EDGE || y >= SECTION_EDGE || z >= SECTION_EDGE {
+            return;
+        }
+        let index = match self.palette.iter().position(|entry| *entry == state) {
+            Some(index) => index,
+            None => {
+                self.palette.push(state);
+                self.palette.len() - 1
+            }
+        };
+        self.cells[(y << 8) | (z << 4) | x] = index as u16;
+    }
+
+    /// Encodes the section in the same NBT shape a 1.21 chunk uses.
+    #[must_use]
+    pub fn to_nbt(&self) -> Tag {
+        let mut container = BTreeMap::new();
+        container.insert(
+            "palette".to_string(),
+            Tag::List(self.palette.iter().map(BlockState::to_nbt).collect()),
+        );
+        if self.palette.len() > 1 {
+            container.insert(
+                "data".to_string(),
+                Tag::LongArray(pack_cells(
+                    bits_for_palette(self.palette.len()),
+                    &self.cells,
+                )),
+            );
+        }
+        let mut section = BTreeMap::new();
+        section.insert("Y".to_string(), Tag::Byte(self.y));
+        section.insert("block_states".to_string(), Tag::Compound(container));
+        Tag::Compound(section)
+    }
+}
+
+fn pack_cells(bits: u8, cells: &[u16]) -> Vec<i64> {
+    let per_long = 64 / usize::from(bits);
+    let mut words = vec![0i64; cells.len().div_ceil(per_long)];
+    for (index, &value) in cells.iter().enumerate() {
+        let word = index / per_long;
+        let shift = (index % per_long) * usize::from(bits);
+        words[word] |= i64::from(value) << shift;
+    }
+    words
 }
 
 fn parse_block_states(tag: &Tag, section: i8) -> Result<(Vec<BlockState>, Vec<u16>), ChunkError> {
@@ -436,6 +523,66 @@ impl Chunk {
     /// Every palette state in the chunk, including duplicates across sections.
     pub fn palette_states(&self) -> impl Iterator<Item = &BlockState> {
         self.sections.values().flat_map(Section::palette)
+    }
+
+    /// Builds a chunk from already-constructed sections.
+    pub fn new(
+        data_version: i32,
+        x: i32,
+        z: i32,
+        sections: Vec<Section>,
+    ) -> Result<Self, ChunkError> {
+        let mut map = BTreeMap::new();
+        for section in sections {
+            let y = section.y;
+            if map.insert(y, section).is_some() {
+                return Err(ChunkError::DuplicateSection { y });
+            }
+        }
+        Ok(Self {
+            data_version,
+            x,
+            z,
+            status: Some("minecraft:full".to_string()),
+            sections: map,
+        })
+    }
+
+    /// Replaces a block at world Y and local chunk X/Z.
+    ///
+    /// A missing section is created as air, so callers can edit any height in
+    /// the 1.21 build range without tracking section storage.
+    pub fn set_block(&mut self, x: i32, y: i32, z: i32, state: BlockState) {
+        if !(0..SECTION_EDGE as i32).contains(&x) || !(0..SECTION_EDGE as i32).contains(&z) {
+            return;
+        }
+        let Ok(section_y) = i8::try_from(y.div_euclid(SECTION_EDGE as i32)) else {
+            return;
+        };
+        let local_y = y.rem_euclid(SECTION_EDGE as i32) as usize;
+        let section = self
+            .sections
+            .entry(section_y)
+            .or_insert_with(|| Section::filled(section_y, BlockState::air()));
+        section.set_block(x as usize, local_y, z as usize, state);
+    }
+
+    /// Encodes the chunk as the NBT root stored in a region file.
+    #[must_use]
+    pub fn to_nbt(&self) -> Tag {
+        let mut chunk = BTreeMap::new();
+        chunk.insert("DataVersion".to_string(), Tag::Int(self.data_version));
+        chunk.insert("xPos".to_string(), Tag::Int(self.x));
+        chunk.insert("zPos".to_string(), Tag::Int(self.z));
+        chunk.insert("yPos".to_string(), Tag::Int(-4));
+        if let Some(status) = &self.status {
+            chunk.insert("Status".to_string(), Tag::String(status.clone()));
+        }
+        chunk.insert(
+            "sections".to_string(),
+            Tag::List(self.sections.values().map(Section::to_nbt).collect()),
+        );
+        Tag::Compound(chunk)
     }
 }
 
@@ -733,26 +880,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_block_states() {
+    fn constructed_chunks_round_trip_through_save_nbt() {
+        let mut section = Section::filled(0, state("minecraft:stone"));
+        section.set_block(1, 2, 3, state("minecraft:grass_block"));
+        let mut chunk = Chunk::new(3953, 4, -5, vec![section]).expect("build chunk");
         assert_eq!(
-            BlockState::from_nbt(&Tag::Int(1)),
-            Err(BlockStateError::NotCompound)
+            chunk.block_at(1, 2, 3).map(ToString::to_string),
+            Some("minecraft:grass_block".to_string())
         );
-        let missing_name = Tag::Compound(BTreeMap::new());
+        assert_eq!(chunk.non_air_blocks(), SECTION_VOLUME);
+
+        chunk.set_block(2, 40, 2, state("minecraft:oak_log"));
         assert_eq!(
-            BlockState::from_nbt(&missing_name),
-            Err(BlockStateError::MissingName)
+            chunk.block_at(2, 40, 2).map(ToString::to_string),
+            Some("minecraft:oak_log".to_string())
         );
-        let wrong_properties = Tag::Compound(BTreeMap::from([
-            (
-                "Name".to_string(),
-                Tag::String("minecraft:stone".to_string()),
-            ),
-            ("Properties".to_string(), Tag::Int(1)),
-        ]));
-        assert_eq!(
-            BlockState::from_nbt(&wrong_properties),
-            Err(BlockStateError::PropertiesNotCompound)
-        );
+
+        let tag = chunk.to_nbt();
+        let parsed = Chunk::parse(&tag).expect("parse encoded chunk");
+        assert_eq!(parsed, chunk);
+        assert_eq!(parsed.section_count(), 2);
+    }
+
+    #[test]
+    fn constructed_section_rejects_bad_cells() {
+        let bad = std::panic::catch_unwind(|| {
+            Section::new(0, vec![state("minecraft:air")], vec![1; SECTION_VOLUME])
+        });
+        assert!(bad.is_err());
     }
 }

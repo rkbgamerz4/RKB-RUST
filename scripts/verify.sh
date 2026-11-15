@@ -20,6 +20,8 @@ cargo run --locked -p rkb-minecraft --bin rkb-fixture -- "${OUT}/world"
 cargo run --locked -p rkb-mc --bin rkb-world -- info "${OUT}/world"
 RKB_RENDER_OUT="${OUT}/minecraft.ppm" \
     cargo test --locked -p rkb-minecraft --test demo_render
+RKB_RENDER_OUT="${OUT}/generated.ppm" \
+    cargo test --locked -p rkb-minecraft --test generated_render
 ./scripts/pack-assets.sh crates/rkb-sandbox/assets "${OUT}/assets.pak"
 cargo run --locked -p rkb-pak --release -- verify "${OUT}/assets.pak"
 
