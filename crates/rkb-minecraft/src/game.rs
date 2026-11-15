@@ -229,12 +229,11 @@ impl MinecraftGame {
         self.spawn = session.spawn.unwrap_or(default_spawn);
         self.player = player_from(session.player, self.spawn);
         self.edits = session.edits;
-        let resident = generated.resident_chunks();
         self.world = Some(WorldState::Generated(generated));
         if !recovered {
             self.message = format!(
-                "Generated world seed {seed:#x} ready ({resident} chunks generated). \
-                 Terrain is produced by RKB, not a bundled save."
+                "Generated world seed {seed:#x} ready. Terrain is produced by RKB, \
+                 not a bundled save."
             );
         }
         self.save_status = "generated world; save pending".to_owned();

@@ -96,6 +96,13 @@ assert_process_alive() {
     done
 }
 
+# The stats line is
+#
+#   world=loaded kind=generated chunks=49/81 visible=18 faces=28197 tris=10294 ...
+#
+# Parse the last complete line instead of grepping for adjacent fields: the
+# fields are not adjacent (`kind=` sits between `world=` and `chunks=`), which
+# made an earlier `world=loaded chunks=` pattern fail even when chunks rendered.
 assert_common_log() {
     local logfile="$1"
     grep -q 'RKB RUST native version' "${logfile}" \
@@ -104,12 +111,25 @@ assert_common_log() {
         || fail "${logfile}: native engine was never created"
     grep -q 'first frame presented' "${logfile}" \
         || fail "${logfile}: no frame was presented"
-    grep -qE 'world=loaded chunks=[1-9][0-9]*/' "${logfile}" \
-        || fail "${logfile}: no chunks were streamed"
-    grep -qE 'faces=[1-9][0-9]*' "${logfile}" \
-        || fail "${logfile}: no block faces were meshed"
-    grep -qE 'tris=[1-9][0-9]*' "${logfile}" \
-        || fail "${logfile}: no block triangles were rendered"
+
+    local stats loaded generated faces tris
+    stats="$(grep -oE 'world=loaded kind=[a-z]+ chunks=[0-9]+/[0-9]+ visible=[0-9]+ faces=[0-9]+ tris=[0-9]+' \
+        "${logfile}" | tail -n1)"
+    [ -n "${stats}" ] || fail "${logfile}: no world stats line was logged"
+    loaded="$(sed -E 's/.*chunks=([0-9]+)\/[0-9]+.*/\1/' <<<"${stats}")"
+    generated="$(sed -E 's/.*chunks=[0-9]+\/([0-9]+) .*/\1/' <<<"${stats}")"
+    faces="$(sed -E 's/.*faces=([0-9]+) .*/\1/' <<<"${stats}")"
+    tris="$(sed -E 's/.*tris=([0-9]+).*/\1/' <<<"${stats}")"
+    log "world stats (${logfile##*/}): chunks=${loaded}/${generated} faces=${faces} tris=${tris}"
+
+    [ "${loaded}" -ge 16 ] \
+        || fail "${logfile}: only ${loaded} chunks were streamed (expected at least 16)"
+    [ "${generated}" -ge "${loaded}" ] \
+        || fail "${logfile}: generated ${generated} chunks but loaded ${loaded}"
+    [ "${faces}" -ge 100 ] \
+        || fail "${logfile}: only ${faces} block faces were meshed"
+    [ "${tris}" -ge 100 ] \
+        || fail "${logfile}: only ${tris} block triangles were rendered"
     if grep -q 'balls=' "${logfile}"; then
         fail "${logfile}: the old sandbox is still running"
     fi
@@ -193,9 +213,9 @@ if grep -qE 'ANR in com\.rkb\.rust|am_anr.*com\.rkb\.rust' "${GENERATED_LOG}" "$
 fi
 
 log "startup summary (generated)"
-grep -E 'RKB RUST native version|native engine created|first frame presented|minecraft client:|world=loaded chunks=' \
+grep -E 'RKB RUST native version|native engine created|first frame presented|minecraft client:|world=loaded kind=' \
     "${GENERATED_LOG}" || true
 log "startup summary (save)"
-grep -E 'RKB RUST native version|native engine created|first frame presented|minecraft client:|world=loaded chunks=' \
+grep -E 'RKB RUST native version|native engine created|first frame presented|minecraft client:|world=loaded kind=' \
     "${SAVE_LOG}" || true
 log "PASS: ${PKG} generated terrain on a fresh install, loaded a supplied 1.21 save, rendered block geometry, and logged no crash"
