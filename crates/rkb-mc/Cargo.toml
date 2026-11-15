@@ -1,0 +1,20 @@
+[package]
+name = "rkb-mc"
+description = "Minecraft: Java Edition 1.21 world-data compatibility for RKB RUST"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rkb-world"
+path = "src/bin/rkb-world.rs"
+
+[dependencies]
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+serde_json = "1.0"
+
+[lints]
+workspace = true

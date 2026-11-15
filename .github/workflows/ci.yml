@@ -118,3 +118,6 @@ jobs:
       - name: Check Android library
         run: |
           cargo check --locked --release --target aarch64-linux-android -p rkb-android
+      - name: Check Minecraft world-data crate for Android
+        run: |
+          cargo check --locked --release --target aarch64-linux-android -p rkb-mc

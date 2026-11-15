@@ -14,6 +14,7 @@ on:
       - "crates/rkb-resource/**"
       - "crates/rkb-runtime/**"
       - "crates/rkb-sandbox/**"
+      - "crates/rkb-mc/**"
       - "scripts/build-android.sh"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -67,6 +68,8 @@ jobs:
           workspaces: ". -> target"
       - name: Cross-compile native library
         run: ./scripts/build-android.sh
+      - name: Check Minecraft world-data crate for ARM64 Android
+        run: cargo check --locked --release --target aarch64-linux-android -p rkb-mc
       - name: Inspect native library
         run: |
           file android/app/src/main/jniLibs/arm64-v8a/librkb_android.so

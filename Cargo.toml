@@ -11,6 +11,7 @@ members = [
     "crates/rkb-demo",
     "crates/rkb-pak",
     "crates/rkb-android",
+    "crates/rkb-mc",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ rkb-input = { path = "crates/rkb-input" }
 rkb-resource = { path = "crates/rkb-resource" }
 rkb-runtime = { path = "crates/rkb-runtime" }
 rkb-sandbox = { path = "crates/rkb-sandbox" }
+rkb-mc = { path = "crates/rkb-mc" }
 jni = { version = "0.21.1", default-features = false }
 
 [workspace.lints.rust]
