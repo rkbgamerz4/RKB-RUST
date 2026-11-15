@@ -416,7 +416,9 @@ class MainActivity : Activity() {
         }
 
         private fun updateOverlay(stats: String) {
-            val current = overlay ?: return
+            // `overlay` alone resolves to `View.getOverlay()` inside this
+            // SurfaceView subclass, so qualify the activity property.
+            val current = this@MainActivity.overlay ?: return
             runOnUiThread {
                 if (!isFinishing && !isDestroyed) {
                     current.text = overlayText(stats)
