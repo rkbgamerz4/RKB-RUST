@@ -2,9 +2,10 @@
 //!
 //! The crate is deliberately honest about scope. It loads user-supplied 1.21
 //! saves, streams and meshes saved chunks, renders opaque block geometry with
-//! flat colours, and provides first-person movement with touch controls.
-//! Textures, lighting, block interaction, inventory, mobs, and survival are not
-//! implemented yet.
+//! a procedural texture atlas, per-vertex ambient occlusion and face shading,
+//! and provides first-person movement with touch controls. Resource-pack
+//! loading, dynamic lighting, inventory, mobs, and survival are not implemented
+//! yet.
 //!
 //! No Minecraft assets, code, or world data are bundled. [`demo_world`] writes
 //! a synthetic save used only by tests and emulator verification.
@@ -19,6 +20,7 @@ pub mod interaction;
 pub mod mesh;
 pub mod player;
 pub mod session;
+pub mod textures;
 pub mod world_source;
 pub mod worldgen;
 

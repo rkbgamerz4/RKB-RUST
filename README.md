@@ -9,25 +9,26 @@ archive format, and a JNI bridge that presents frames through a Kotlin
 `SurfaceView`. It also contains the **first playable milestone of a Minecraft:
 Java Edition 1.21 client**: the app creates a deterministic generated world on
 first launch (or reads a user-supplied 1.21 save), streams and meshes chunks,
-renders opaque block geometry with a first-person camera and collision, supports
+renders textured block geometry with a first-person camera and collision, supports
 touch movement plus block breaking/placing, and persists seed, player pose, and
 edits.
 
-This is not a complete Minecraft client. There are no textures, lighting,
-inventory, mobs, survival, or networking yet. The project contains no Minecraft
-assets, jars, or game files.
+This is not a complete Minecraft client. There are no Mojang textures or
+resource packs, dynamic lightmaps or shadows, inventory, mobs, survival, or
+networking yet. The project contains no Minecraft assets, jars, or game files;
+block textures are generated procedurally by RKB code.
 
 ## Status
 
 | Area | State |
 | --- | --- |
-| Rust workspace | Building on stable Rust; 199 unit/integration tests |
-| Renderer | Software RGBA8 rasterizer with primitives, alpha blending, 2D camera, and a depth-tested perspective 3D triangle path |
+| Rust workspace | Building on stable Rust; 212 unit/integration tests |
+| Renderer | Software RGBA8 rasterizer with primitives, alpha blending, a 2D camera, texture sampling, and a reciprocal-depth perspective 3D path with per-vertex UV/light |
 | Runtime | Fixed timestep, accumulation and drop accounting, lifecycle FSM, resize handling |
 | Input | Multi-touch state, tap/drag/pinch detectors, virtual joystick, touch button |
 | Resources | Traversal-safe paths, memory/file sources, checksummed `RKBPAK1` archives, LRU cache |
 | Minecraft data | 1.21/1.21.1 saved-world reader and atomic writer: NBT, Anvil regions, chunk palettes and construction, block states, registry reports, `rkb-world` CLI |
-| Minecraft client | `rkb-minecraft`: default seeded terrain, save loading, background chunk streaming and face meshing, depth-tested flat-colour block rendering, first-person camera, walking/jumping/flight, AABB collision, raycast break/place, session persistence and autosave |
+| Minecraft client | `rkb-minecraft`: default seeded terrain, save loading, background chunk streaming and face meshing, textured block rendering from a procedural atlas with face shading and ambient occlusion, first-person camera, walking/jumping/flight, AABB collision, raycast break/place, session persistence and autosave |
 | Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host that launches the Minecraft client, 0.6x render scaling, status/help overlay, lifecycle and touch wiring |
 | CI | Format, clippy, tests, release build, generated and saved world renders, NDK ARM64 build, APK and ABI verification, emulator fresh-install and supplied-save assertions |
 
@@ -41,10 +42,11 @@ belongs.
 `rkb-minecraft` is the client crate. On a fresh install it creates a
 deterministic, seeded overworld from RKB code; if the world directory contains
 a user save it opens that instead. It streams chunks around the player, meshes
-exposed block faces with edit awareness, and renders them as flat per-block
-colours with per-face shading. The Android APK launches this client; the old
-ball sandbox is no longer wired into the app and remains only as the headless
-stack demo.
+exposed block faces with edit awareness, and renders them with a procedurally
+generated 16x16 block atlas, Minecraft-style directional face shading,
+per-vertex ambient occlusion, and distance fog. The Android APK launches this
+client; the old ball sandbox is no longer wired into the app and remains only as
+the headless stack demo.
 
 Implemented:
 
@@ -56,8 +58,15 @@ Implemented:
   A save wins over generated terrain when no RKB marker/session exists.
 - Chunk streaming across a 7x7 chunk area, neighbour-aware face culling,
   frustum culling, and mesh refresh after edits.
-- Depth-tested perspective projection, near-plane clipping, and back-face
-  culling in the software renderer.
+- Procedural, deterministic block textures (16x16 tiles in a 128x64 atlas) for
+  grass top/side, dirt, stone, cobblestone, sand, gravel, snow, ice, logs,
+  leaves, planks, water, lava, bedrock, and more. No Mojang assets are copied.
+- Per-face tile selection with upright UVs, Minecraft's 1.0/0.8/0.6/0.5
+  directional face shading, and per-vertex ambient occlusion baked into the
+  chunk mesh. Unknown block names keep a stable hashed tint.
+- Depth-tested perspective projection with near-plane clipping, back-face
+  culling, reciprocal-depth (`1/w`) rasterization, perspective-correct texture
+  sampling, a smooth gradient sky, and full-strength distance fog.
 - Spawn selection, ground snapping, gravity, jumping, creative flight, AABB
   collision, and fall respawn.
 - Crosshair raycast (5-block reach) with **BREAK** and **PLACE** buttons.
@@ -72,12 +81,12 @@ Implemented:
   streamed/visible chunk counts, face/triangle/block counts, edit count,
   position, and save status.
 
-Not implemented yet: textures/resource packs, biome tints, lighting/shadows,
-block shapes (slabs, stairs, fences, and other non-cube blocks are treated as
-full cubes for both rendering and collision), inventory, crafting, mobs,
-survival, sound, and networking. Block colours are approximations, not extracted
-Mojang textures. Generated terrain is RKB terrain, not Mojang's world generator;
-it reproduces no vanilla seed.
+Not implemented yet: resource-pack/Mojang textures, biome colour blending,
+dynamic lightmaps and shadows, block shapes (slabs, stairs, fences, and other
+non-cube blocks are treated as full cubes for both rendering and collision),
+inventory, crafting, mobs, survival, sound, and networking. The atlas is an
+original procedural approximation, not extracted Mojang art. Generated terrain is
+RKB terrain, not Mojang's world generator; it reproduces no vanilla seed.
 
 ### Run a world on Android
 
@@ -253,7 +262,7 @@ Headless sandbox demo (`rkb-demo` and `rkb-sandbox` tests):
 | --- | --- |
 | `rkb-core` | Math, fixed timestep, lifecycle FSM, config parser and `EngineConfig` |
 | `rkb-platform` | `Surface`/`FrameClock` traits, headless surface, platform info |
-| `rkb-render` | Colors, framebuffer, clipping/blending, primitives, draw lists, `Camera2D` |
+| `rkb-render` | Colors, framebuffer, clipping/blending, primitives, draw lists, `Camera2D`, texture sampling, reciprocal-depth 3D path |
 | `rkb-input` | Touch points/events, tap/drag/pinch detectors, virtual controls |
 | `rkb-resource` | Asset paths and IDs, memory/file sources, `RKBPAK1`, LRU cache |
 | `rkb-runtime` | Fixed-step loop, lifecycle, input forwarding, frame presentation |
@@ -261,7 +270,7 @@ Headless sandbox demo (`rkb-demo` and `rkb-sandbox` tests):
 | `rkb-demo` | Headless CLI that runs the sandbox and writes a PPM frame |
 | `rkb-pak` | CLI to pack, list, verify, and unpack `RKBPAK1` archives |
 | `rkb-mc` | Minecraft: Java Edition 1.21 NBT, Anvil regions, chunk palettes, block registry, world access, and `rkb-world` CLI |
-| `rkb-minecraft` | 1.21 client: chunk streaming/meshing, camera, physics, touch controls, flat-colour block renderer, and the `rkb-fixture` generator |
+| `rkb-minecraft` | 1.21 client: chunk streaming/meshing, procedural block atlas, camera, physics, touch controls, textured block renderer, and the `rkb-fixture` generator |
 | `rkb-android` | JNI exports and host-testable Android engine/bridge that launches the Minecraft client |
 
 ## Asset archives
@@ -305,11 +314,12 @@ Android NDK cross-compile, Gradle APK build, and artifact uploads.
   heightmaps, block entities, entities, structures, and lighting, and does not
   decode LZ4 region compression. It writes RKB-generated worlds only; a user
   save is never modified in place.
-- The Minecraft client renders blocks as opaque full cubes with flat
-  approximate colours: no textures, resource packs, biome tints, lighting,
-  shadows, or transparent blocks. Non-cube shapes such as slabs, stairs, and
-  fences are treated as full cubes, so geometry and collision boxes for those
-  blocks are approximate.
+- The Minecraft client renders blocks as opaque full cubes with an original
+  procedural texture atlas, directional face shading, per-vertex ambient
+  occlusion, and distance fog. It does not load resource packs, apply biome
+  tint blending, sample lightmaps, cast shadows, or render transparent blocks.
+  Non-cube shapes such as slabs, stairs, and fences are treated as full cubes,
+  so geometry and collision boxes for those blocks are approximate.
 - Generated terrain is RKB terrain produced from a seed. It does not reproduce
   Mojang's world generator, vanilla seeds, caves, ores, or structures.
 - Block breaking/placing works through a client edit overlay (5-block reach,

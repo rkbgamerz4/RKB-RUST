@@ -101,6 +101,113 @@ impl Camera {
         }
         clipped_count
     }
+
+    /// Clips a textured world-space polygon to the near plane and projects it.
+    ///
+    /// This is [`Self::project_polygon`] with per-corner atlas UVs and light
+    /// preserved through clipping. Interpolating them in clip space keeps the
+    /// perspective-correct rasterizer exact; `uv` and `light` must have at least
+    /// as many entries as `points`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_polygon_textured(
+        self,
+        view_projection: Mat4,
+        viewport: Vec2,
+        points: &[Vec3],
+        uv: &[[f32; 2]],
+        light: &[f32],
+        out: &mut [Vertex3D; 8],
+    ) -> usize {
+        let count = points.len().min(uv.len()).min(light.len()).min(8);
+        let mut vertices = [TexturedVertex::default(); 8];
+        for index in 0..count {
+            vertices[index] = TexturedVertex {
+                clip: view_projection.transform_vec4(points[index]),
+                u: uv[index][0],
+                v: uv[index][1],
+                light: light[index],
+            };
+        }
+        let mut clipped = [TexturedVertex::default(); 8];
+        let clipped_count = clip_near_textured(&vertices[..count], &mut clipped);
+        for index in 0..clipped_count {
+            let vertex = clipped[index];
+            let projected = project_clip(
+                Vec3::new(vertex.clip[0], vertex.clip[1], vertex.clip[2]),
+                vertex.clip[3],
+                viewport,
+            );
+            out[index] = Vertex3D::with_attributes(
+                projected.x,
+                projected.y,
+                projected.depth,
+                projected.inv_w,
+                vertex.u,
+                vertex.v,
+                vertex.light,
+            );
+        }
+        clipped_count
+    }
+}
+
+/// A clip-space vertex carrying the attributes that survive near clipping.
+#[derive(Clone, Copy, Debug)]
+struct TexturedVertex {
+    clip: [f32; 4],
+    u: f32,
+    v: f32,
+    light: f32,
+}
+
+impl Default for TexturedVertex {
+    fn default() -> Self {
+        Self {
+            clip: [0.0; 4],
+            u: 0.0,
+            v: 0.0,
+            light: 1.0,
+        }
+    }
+}
+
+/// Sutherland-Hodgman clip that lerps UV/light alongside the clip position.
+fn clip_near_textured(polygon: &[TexturedVertex], out: &mut [TexturedVertex; 8]) -> usize {
+    if polygon.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    for index in 0..polygon.len() {
+        let current = polygon[index];
+        let previous = polygon[(index + polygon.len() - 1) % polygon.len()];
+        let current_in = current.clip[2] + current.clip[3] >= 0.0;
+        let previous_in = previous.clip[2] + previous.clip[3] >= 0.0;
+        if current_in != previous_in {
+            let d_previous = previous.clip[2] + previous.clip[3];
+            let d_current = current.clip[2] + current.clip[3];
+            let denominator = d_previous - d_current;
+            if denominator.abs() > f32::EPSILON && count < out.len() {
+                let t = (d_previous / denominator).clamp(0.0, 1.0);
+                out[count] = TexturedVertex {
+                    clip: [
+                        previous.clip[0] + (current.clip[0] - previous.clip[0]) * t,
+                        previous.clip[1] + (current.clip[1] - previous.clip[1]) * t,
+                        previous.clip[2] + (current.clip[2] - previous.clip[2]) * t,
+                        previous.clip[3] + (current.clip[3] - previous.clip[3]) * t,
+                    ],
+                    u: previous.u + (current.u - previous.u) * t,
+                    v: previous.v + (current.v - previous.v) * t,
+                    light: previous.light + (current.light - previous.light) * t,
+                };
+                count += 1;
+            }
+        }
+        if current_in && count < out.len() {
+            out[count] = current;
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Sutherland-Hodgman clip against the near plane (`z + w >= 0`).
@@ -225,6 +332,52 @@ mod tests {
         assert!((out[0].x - 160.0).abs() < 0.01, "{:?}", out[0]);
         assert!((out[0].y - 90.0).abs() < 0.01, "{:?}", out[0]);
         assert!(out[0].inv_w > 0.0);
+    }
+
+    #[test]
+    fn textured_projection_keeps_uvs_and_light_through_near_clipping() {
+        let camera = Camera::new(Vec3::ZERO);
+        let viewport = Vec2::new(320.0, 180.0);
+        let vp = camera.view_projection(viewport);
+        let mut out = [Vertex3D::new(0.0, 0.0, 0.0, 0.0); 8];
+        let points = [
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(1.0, 1.0, -5.0),
+            Vec3::new(-1.0, 1.0, -5.0),
+        ];
+        let uv = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let light = [0.4, 0.6, 0.8, 1.0];
+        let count = camera.project_polygon_textured(vp, viewport, &points, &uv, &light, &mut out);
+        assert!(count >= 3, "clipped polygon has {count} vertices");
+        for vertex in &out[..count] {
+            assert!(vertex.u.is_finite() && vertex.v.is_finite());
+            assert!((0.0..=1.0).contains(&vertex.u), "{vertex:?}");
+            assert!((0.0..=1.0).contains(&vertex.v), "{vertex:?}");
+            assert!((0.4..=1.0).contains(&vertex.light), "{vertex:?}");
+        }
+    }
+
+    #[test]
+    fn fully_visible_quad_projects_uvs_unchanged() {
+        let camera = Camera::new(Vec3::ZERO);
+        let viewport = Vec2::new(320.0, 180.0);
+        let vp = camera.view_projection(viewport);
+        let mut out = [Vertex3D::new(0.0, 0.0, 0.0, 0.0); 8];
+        let points = [
+            Vec3::new(-1.0, -1.0, -5.0),
+            Vec3::new(1.0, -1.0, -5.0),
+            Vec3::new(1.0, 1.0, -5.0),
+            Vec3::new(-1.0, 1.0, -5.0),
+        ];
+        let uv = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let light = [0.5, 0.5, 1.0, 1.0];
+        let count = camera.project_polygon_textured(vp, viewport, &points, &uv, &light, &mut out);
+        assert_eq!(count, 4);
+        for index in 0..4 {
+            assert_eq!([out[index].u, out[index].v], uv[index]);
+            assert_eq!(out[index].light, light[index]);
+        }
     }
 
     #[test]

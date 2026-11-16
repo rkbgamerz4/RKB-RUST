@@ -44,8 +44,9 @@ MinecraftGame::update
        └─ build_chunk_mesh: 3x3 neighbourhood, hidden-face culling, edits
 MinecraftGame::render
   ├─ Camera::view_projection + Frustum::contains_aabb
-  ├─ back-face culling, near-plane clipping -> DrawCommand::Triangle3D
-  └─ sky gradient, distance fog, crosshair, joystick/buttons
+  ├─ back-face culling, near-plane clipping (UV/light preserved)
+  ├─ procedural atlas lookup -> DrawCommand::TexturedTriangle3D
+  └─ gradient sky, distance fog, crosshair, joystick/buttons
 MinecraftGame::save (autosave/update; pause/stop/destroy)
   ├─ rkb-session.json (atomic: seed, spawn, player, edits)
   └─ generated worlds: level.dat + region/r.X.Z.mca (atomic), marker
@@ -84,18 +85,23 @@ A deterministic software rasterizer:
 - `Color` with RGB/RGBA/hex parsing.
 - `Framebuffer` with bounds and clipping access.
 - Alpha blending and clipped lines, rectangles, circles, triangles.
-- A depth-tested perspective path: `Vertex3D` carries clip-space coordinates
-  and `1/w`; `project_clip` maps them to viewport pixels; `Triangle3D` is
-  rasterized with perspective-correct depth against a resizable depth buffer.
-  `Camera::project_polygon` clips polygons crossing the near plane first.
-- Texture sampling.
-- `DrawList`/`DrawCommand` + `RenderBackend` trait.
+- A depth-tested perspective path: `Vertex3D` carries viewport pixels, clip
+  `1/w`, atlas UVs, and a light multiplier; `project_clip` maps clip space to the
+  viewport, and `TexturedTriangle3D` rasterizes with perspective-correct UV/light
+  interpolation against a reciprocal-depth (`1/w`) buffer. Reciprocal depth is
+  linear in screen space and avoids the precision cliff of `z/w` far from the
+  near plane. `Camera::project_polygon_textured` clips polygons crossing the near
+  plane while interpolating their attributes.
+- Procedural RGBA8 texture storage with nearest-neighbour sampling.
+- `DrawList`/`DrawCommand` + `RenderBackend` trait; an `Arc<Texture>` atlas can
+  be attached to the list and is shared without copying.
 - `SoftwareBackend` executes a frame into a framebuffer and reports statistics.
 - `Camera2D` maps world coordinates into the viewport.
 
-2D commands keep their painter's-order behaviour; only `Triangle3D` participates
-in the depth test. The backend trait is deliberately small so a GPU
-implementation can be added without touching game code.
+2D commands keep their painter's-order behaviour; `Triangle3D` and
+`TexturedTriangle3D` participate in the depth test. The backend trait is
+deliberately small so a GPU implementation can be added without touching game
+code.
 
 ### `rkb-input`
 
@@ -187,17 +193,19 @@ atomically. `fixture` generates synthetic saves for tests.
 
 ### `rkb-minecraft`
 
-The playable client. `blocks` maps block names to approximate colours and a
-solidity rule, `mesh` builds per-chunk face lists with neighbour culling and an
-`EditMap` overlay, `camera` provides view/projection, frustum planes, and
-polygon clipping, `player` implements AABB collision, gravity, jumping, and
-flight, `interaction` raycasts for break/place, `worldgen` produces deterministic
-seeded terrain on a background worker, `world_source` unifies saves and
-generated data, `session` persists seed/player/edits, `demo_world` writes the
-synthetic island, and `game` ties them into a `Game`: world selection, chunk
-streaming, touch input, block edits, autosave, scene drawing, and status text.
-The `rkb-fixture` binary writes the synthetic island for CI and emulator
-verification.
+The playable client. `blocks` maps block names to approximate fallback colours
+and a solidity rule, `textures` generates the procedural 128x64 block atlas and
+picks a tile/tint per block name and face, `mesh` builds per-chunk face lists
+with neighbour culling, upright UVs, face shading, and per-vertex ambient
+occlusion over an `EditMap` overlay, `camera` provides view/projection, frustum
+planes, and polygon clipping that preserves UV/light, `player` implements AABB
+collision, gravity, jumping, and flight, `interaction` raycasts for break/place,
+`worldgen` produces deterministic seeded terrain on a background worker,
+`world_source` unifies saves and generated data, `session` persists
+seed/player/edits, `demo_world` writes the synthetic island, and `game` ties
+them into a `Game`: world selection, chunk streaming, touch input, block edits,
+autosave, textured scene drawing, fog, and status text. The `rkb-fixture` binary
+writes the synthetic island for CI and emulator verification.
 
 ### `rkb-android`
 

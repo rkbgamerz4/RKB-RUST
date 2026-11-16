@@ -390,14 +390,21 @@ property enums/integers, and block behaviour tables.
 
 `rkb-minecraft` streams chunks from either a save or the generated world, meshes
 exposed block faces with neighbour culling, frustum-culls chunk bounds, and
-renders blocks through the software renderer's depth-tested 3D triangle path.
-Every non-air block is treated as a full cube with a flat approximate colour and
-per-face shading; there is no texture atlas, lightmap, block model, or shape
-support.
+renders blocks through the software renderer's depth-tested 3D path. Every
+non-air block is treated as a full cube. Each face selects a tile from an
+original, procedurally generated 16x16 atlas (grass top/side, dirt, stone,
+cobblestone, sand, gravel, snow, ice, logs, leaves, planks, water, lava, and
+more), gets upright atlas UVs, Minecraft's 1.0/0.8/0.6/0.5 directional shade, and
+per-vertex ambient occlusion baked into the mesh. The rasterizer interpolates
+UV and light perspective-correctly against a reciprocal-depth (`1/w`) buffer.
+The sky is a smooth gradient and distance fog reaches full strength.
 
-Next: texture atlas from a user's resource pack, transparent and non-cube block
-models (slabs, stairs, fences), lightmap sampling, and memory/frame budgets for
-low/mid-range phones.
+No Mojang asset, atlas, or resource-pack data is bundled or copied; every texel
+is produced by deterministic RKB code.
+
+Next: loading a user's resource pack, biome tint blending, transparent and
+non-cube block models (slabs, stairs, fences), lightmap sampling, and
+memory/frame budgets for low/mid-range phones.
 
 ### 5. Player movement and camera
 
@@ -436,10 +443,15 @@ and client interpolation.
 
 ### 9. Lighting and environment
 
-Not implemented.
+Partially implemented: Minecraft-style directional face shading, per-vertex
+ambient occlusion from neighbouring blocks, a smooth sky gradient, and
+full-strength distance fog are baked or applied at render time.
 
-Next: light arrays from chunks, sky/block light propagation, day/night, weather,
-fog, and biome colours.
+Not implemented: light arrays from chunks, sky/block light propagation,
+day/night, weather, biome tint blending, and dynamic shadows.
+
+Next: read section light arrays, propagate sky/block light, then add day/night
+and weather.
 
 ### 10. Survival mechanics
 
@@ -460,9 +472,12 @@ Next: health, hunger, damage, respawn, experience, and the survival HUD.
   user save are ignored;
 - the registry is not bundled and is only used by the `registry` command, not
   yet to validate every palette entry;
-- the client treats every block as a full cube with an approximate flat colour:
-  no textures, resource packs, biome tints, lighting, shadows, or partial-block
-  shapes (slabs, stairs, fences, and similar blocks render and collide as cubes);
+- the client treats every block as a full cube with an original procedural
+  texture atlas, directional face shading, per-vertex ambient occlusion, and
+  distance fog. It does not load resource packs or Mojang textures, blend biome
+  colours, sample lightmaps, cast shadows, or render transparent blocks, and
+  partial-block shapes (slabs, stairs, fences, and similar blocks) render and
+  collide as cubes;
 - placing always produces oak planks, and block hardness/tools/drops are not
   modeled;
 - inventory, crafting, mobs, survival, and networking are not implemented;
@@ -472,13 +487,17 @@ Next: health, hunger, damage, respawn, experience, and the survival HUD.
 
 ## Tests
 
-`cargo test --workspace` currently runs 199 unit/integration tests, including:
+`cargo test --workspace` currently runs 212 unit/integration tests, including:
 
 - 41 `rkb-mc` unit tests plus 6 CLI integration tests that build synthetic
   saves and run the binary;
 - `rkb-minecraft` tests for generated terrain determinism, surface and spawn
   correctness, background chunk delivery, save/reopen, edit-aware meshing,
-  raycast reach, generated startup stats, session round-trip, and break/place;
+  face-specific atlas tiles, upright UVs, ambient occlusion, textured and
+  near-clipped projection attributes, raycast reach, generated startup stats,
+  session round-trip, and break/place;
+- `rkb-render` tests for reciprocal-depth ordering, coplanar seams, textured
+  sampling, and fog/light application;
 - `rkb-android` host tests that create an engine with no save and assert
   generated terrain, persisted `level.dat`/`rkb-session.json`, and rendered
   faces;

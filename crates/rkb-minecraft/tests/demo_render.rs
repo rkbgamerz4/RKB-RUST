@@ -63,7 +63,36 @@ fn demo_world_renders_real_block_geometry() {
         .chunks_exact(4)
         .map(|pixel| [pixel[0], pixel[1], pixel[2]])
         .collect::<std::collections::BTreeSet<_>>();
-    assert!(unique.len() > 16, "only {} colours in frame", unique.len());
+    assert!(
+        unique.len() > 256,
+        "texture detail produced only {} colours",
+        unique.len()
+    );
+
+    // Textured grass/leaves and dirt/wood must both be visible, and no pixel
+    // should be the untextured black a broken atlas path would leave behind.
+    let mut green = 0_usize;
+    let mut brown = 0_usize;
+    let mut black = 0_usize;
+    for pixel in pixels.chunks_exact(4) {
+        let (r, g, b) = (
+            i32::from(pixel[0]),
+            i32::from(pixel[1]),
+            i32::from(pixel[2]),
+        );
+        if g > r + 10 && g > b + 10 {
+            green += 1;
+        }
+        if r > g + 10 && g > b {
+            brown += 1;
+        }
+        if r + g + b < 12 {
+            black += 1;
+        }
+    }
+    assert!(green > 500, "only {green} green (grass/leaf) pixels");
+    assert!(brown > 200, "only {brown} brown (dirt/wood) pixels");
+    assert_eq!(black, 0, "{black} black pixels in the frame");
     assert_eq!(
         runtime.game().viewport(),
         Vec2::new(WIDTH as f32, HEIGHT as f32)

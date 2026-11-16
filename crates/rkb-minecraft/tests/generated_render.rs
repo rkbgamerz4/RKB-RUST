@@ -68,7 +68,31 @@ fn generated_world_renders_without_any_save() {
         .chunks_exact(4)
         .map(|pixel| [pixel[0], pixel[1], pixel[2]])
         .collect::<std::collections::BTreeSet<_>>();
-    assert!(unique.len() > 16, "only {} colours in frame", unique.len());
+    assert!(
+        unique.len() > 128,
+        "texture detail produced only {} colours",
+        unique.len()
+    );
+
+    // Snow terrain must cover a meaningful part of the frame, and no pixel
+    // should be untextured black.
+    let mut snowy = 0_usize;
+    let mut black = 0_usize;
+    for pixel in runtime.framebuffer().pixels().chunks_exact(4) {
+        let (r, g, b) = (
+            i32::from(pixel[0]),
+            i32::from(pixel[1]),
+            i32::from(pixel[2]),
+        );
+        if r > 200 && g > 210 && b > 210 {
+            snowy += 1;
+        }
+        if r + g + b < 12 {
+            black += 1;
+        }
+    }
+    assert!(snowy > 1_000, "only {snowy} snow pixels");
+    assert_eq!(black, 0, "{black} black pixels in the frame");
 
     if let Ok(path) = std::env::var("RKB_RENDER_OUT") {
         let file = fs::File::create(&path).expect("create PPM");

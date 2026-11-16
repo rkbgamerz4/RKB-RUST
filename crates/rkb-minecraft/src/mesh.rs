@@ -1,9 +1,11 @@
-//! Block colours, solidity, and chunk meshing.
+//! Block meshing with atlas tiles, face shading, and ambient occlusion.
 //!
-//! Minecraft textures are not bundled. Every face gets a flat colour derived
-//! from its block name, with per-face shading so the geometry reads as a
-//! three-dimensional world. This is a deliberate first step: it renders real
-//! saved block data without pretending to have the resource pack pipeline.
+//! Minecraft textures are not bundled. Faces point at tiles in the procedural
+//! atlas from [`crate::textures`]: the mesher picks the tile and tint for each
+//! block name and face direction, computes upright UVs, and bakes Minecraft's
+//! directional face shade together with per-vertex ambient occlusion into the
+//! face. The mesher itself stays renderer-agnostic, so the world/save paths do
+//! not depend on texture details.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,6 +15,7 @@ use rkb_mc::{BlockState, Chunk};
 use rkb_render::Color;
 
 use crate::blocks::{block_color, is_solid};
+use crate::textures::{block_tile, FaceDir, Tile};
 use crate::world_source::ChunkSource;
 use crate::worldgen::{WORLD_MAX_Y, WORLD_MIN_Y};
 
@@ -22,9 +25,22 @@ pub type EditMap = BTreeMap<(i32, i32, i32), BlockState>;
 /// One outward-facing block face in world space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Face {
+    /// World-space corners, counter-clockwise when viewed from outside.
     pub points: [Vec3; 4],
     pub normal: Vec3,
+    /// Flat fallback colour (texture tint ignored) for backends without an atlas.
     pub color: Color,
+    /// Atlas tile for this block face.
+    pub tile: Tile,
+    /// Multiplied over the tile texels (`white` for tiles that already hold colour).
+    pub tint: Color,
+    /// Minecraft directional shading for this face direction.
+    pub shade: f32,
+    /// Tile-local UVs in `[0, 1]`, one per corner; V grows downwards so side
+    /// textures stay upright.
+    pub uv: [[f32; 2]; 4],
+    /// Per-corner light: ambient occlusion multiplied by the face shade.
+    pub light: [f32; 4],
 }
 
 impl Face {
@@ -151,7 +167,6 @@ pub fn build_chunk_mesh(
                         continue;
                     }
                     mesh.non_air_blocks += 1;
-                    let color = block_color(&effective.name);
                     emit_face(
                         &mut mesh.faces,
                         &neighbors,
@@ -161,7 +176,7 @@ pub fn build_chunk_mesh(
                         wx,
                         wy,
                         wz,
-                        color,
+                        &effective.name,
                     );
                 }
             }
@@ -191,7 +206,7 @@ pub fn build_chunk_mesh(
             wx,
             wy,
             wz,
-            block_color(&state.name),
+            &state.name,
         );
     }
 
@@ -206,7 +221,32 @@ pub fn build_chunk_mesh(
     Ok(Some(mesh))
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// One component of a unit-cube corner.
+fn corner_axis(corner: Vec3, axis: usize) -> f32 {
+    match axis {
+        0 => corner.x,
+        1 => corner.y,
+        _ => corner.z,
+    }
+}
+
+/// Block-cell offset along one axis.
+fn cell_offset(axis: usize, amount: i32) -> (i32, i32, i32) {
+    match axis {
+        0 => (amount, 0, 0),
+        1 => (0, amount, 0),
+        _ => (0, 0, amount),
+    }
+}
+
+fn add_offset(a: (i32, i32, i32), b: (i32, i32, i32)) -> (i32, i32, i32) {
+    (a.0 + b.0, a.1 + b.1, a.2 + b.2)
+}
+
+/// Neighbour offset, normal, unit-cube corners, and face direction.
+type FaceSpec = ((i32, i32, i32), Vec3, [Vec3; 4], FaceDir);
+
+#[allow(clippy::too_many_arguments)]
 fn emit_face(
     faces: &mut Vec<Face>,
     neighbors: &Neighborhood,
@@ -216,11 +256,11 @@ fn emit_face(
     wx: i32,
     wy: i32,
     wz: i32,
-    color: Color,
+    name: &str,
 ) {
     let origin = Vec3::new(wx as f32, wy as f32, wz as f32);
-    // (neighbour offset, normal, four corners as unit-cube offsets, shade)
-    let directions: [((i32, i32, i32), Vec3, [Vec3; 4], f32); 6] = [
+    // (neighbour offset, normal, four corners as unit-cube offsets, direction)
+    let directions: [FaceSpec; 6] = [
         (
             (1, 0, 0),
             Vec3::new(1.0, 0.0, 0.0),
@@ -230,7 +270,7 @@ fn emit_face(
                 Vec3::new(1.0, 1.0, 1.0),
                 Vec3::new(1.0, 0.0, 1.0),
             ],
-            0.78,
+            FaceDir::PosX,
         ),
         (
             (-1, 0, 0),
@@ -241,7 +281,7 @@ fn emit_face(
                 Vec3::new(0.0, 1.0, 1.0),
                 Vec3::new(0.0, 0.0, 1.0),
             ],
-            0.62,
+            FaceDir::NegX,
         ),
         (
             (0, 1, 0),
@@ -252,7 +292,7 @@ fn emit_face(
                 Vec3::new(1.0, 1.0, 1.0),
                 Vec3::new(0.0, 1.0, 1.0),
             ],
-            1.0,
+            FaceDir::PosY,
         ),
         (
             (0, -1, 0),
@@ -263,7 +303,7 @@ fn emit_face(
                 Vec3::new(1.0, 0.0, 1.0),
                 Vec3::new(0.0, 0.0, 1.0),
             ],
-            0.45,
+            FaceDir::NegY,
         ),
         (
             (0, 0, 1),
@@ -274,7 +314,7 @@ fn emit_face(
                 Vec3::new(1.0, 1.0, 1.0),
                 Vec3::new(0.0, 1.0, 1.0),
             ],
-            0.70,
+            FaceDir::PosZ,
         ),
         (
             (0, 0, -1),
@@ -285,18 +325,95 @@ fn emit_face(
                 Vec3::new(1.0, 1.0, 0.0),
                 Vec3::new(0.0, 1.0, 0.0),
             ],
-            0.55,
+            FaceDir::NegZ,
         ),
     ];
 
-    for ((dx, dy, dz), normal, corners, shade) in directions {
+    for ((dx, dy, dz), normal, corners, face) in directions {
         if !is_air_at(neighbors, edits, cx, cz, wx + dx, wy + dy, wz + dz) {
             continue;
         }
+        let (tile, tint) = block_tile(name, face);
+        let shade = face.shade();
+        let normal_axis = if normal.x.abs() > 0.5 {
+            0
+        } else if normal.y.abs() > 0.5 {
+            1
+        } else {
+            2
+        };
+        // Side textures stay upright: V follows +Y (flipped, since texture rows
+        // run top to bottom); top/bottom faces map V to Z.
+        let (u_axis, v_axis, flip_v) = match normal_axis {
+            0 => (2, 1, true),
+            1 => (0, 2, false),
+            _ => (0, 1, true),
+        };
+        let tangent_axes: [usize; 2] = match normal_axis {
+            0 => [1, 2],
+            1 => [0, 2],
+            _ => [0, 1],
+        };
+        let base = (wx + dx, wy + dy, wz + dz);
+        let mut uv = [[0.0_f32; 2]; 4];
+        let mut light = [0.0_f32; 4];
+        for (index, corner) in corners.iter().enumerate() {
+            let u = corner_axis(*corner, u_axis);
+            let v_axis_value = corner_axis(*corner, v_axis);
+            uv[index] = [
+                u,
+                if flip_v {
+                    1.0 - v_axis_value
+                } else {
+                    v_axis_value
+                },
+            ];
+
+            // Ambient occlusion: sample the two edge neighbours and the diagonal
+            // in the plane one block outside this face.
+            let along_a = if corner_axis(*corner, tangent_axes[0]) > 0.5 {
+                1
+            } else {
+                -1
+            };
+            let along_b = if corner_axis(*corner, tangent_axes[1]) > 0.5 {
+                1
+            } else {
+                -1
+            };
+            let side_a = add_offset(base, cell_offset(tangent_axes[0], along_a));
+            let side_b = add_offset(base, cell_offset(tangent_axes[1], along_b));
+            let diagonal = add_offset(
+                base,
+                add_offset(
+                    cell_offset(tangent_axes[0], along_a),
+                    cell_offset(tangent_axes[1], along_b),
+                ),
+            );
+            let occludes = |cell: (i32, i32, i32)| {
+                !is_air_at(neighbors, edits, cx, cz, cell.0, cell.1, cell.2)
+            };
+            let a = occludes(side_a);
+            let b = occludes(side_b);
+            let c = occludes(diagonal);
+            let ao = if a && b {
+                0.6
+            } else {
+                1.0 - 0.2 * u8::from(a) as f32 - 0.2 * u8::from(b) as f32 - 0.2 * u8::from(c) as f32
+            };
+            light[index] = ao * shade;
+        }
+
         faces.push(Face {
             points: corners.map(|corner| corner + origin),
             normal,
-            color: color.shaded(shade),
+            // Shaded flat colour remains a usable fallback without an atlas.
+            color: block_color(name).shaded(shade),
+            tile,
+            tint,
+            shade,
+            uv,
+            light,
         });
     }
 }
@@ -397,6 +514,90 @@ mod tests {
             .filter(|face| face.normal.x.abs() > 0.9)
             .count();
         assert_eq!(wall, 2 * 256);
+    }
+
+    #[test]
+    fn faces_carry_upright_atlas_uvs_and_face_shading() {
+        let dir = TempDir::new("mesh-uv");
+        let chunks = [(0, 0, chunk_tag(3953, 0, 0, vec![stone_section()]))];
+        write_world(dir.path(), &level_tag(3953, "Mesh"), &chunks).unwrap();
+        let mut world = World::open(dir.path()).unwrap();
+        let mesh = build_chunk_mesh(&mut world, 0, 0, &EditMap::new())
+            .unwrap()
+            .unwrap();
+
+        let top = mesh
+            .faces
+            .iter()
+            .find(|face| face.normal.y > 0.9)
+            .expect("top face");
+        assert_eq!(top.tile, Tile::Stone);
+        assert_eq!(top.shade, 1.0);
+        assert_eq!(top.light, [1.0; 4]);
+
+        // Side textures are upright: the highest corner samples the top of the
+        // tile (V = 0) and the lowest corner samples the bottom (V = 1).
+        for face in mesh.faces.iter().filter(|face| face.normal.y.abs() < 0.5) {
+            let expected_shade = if face.normal.x.abs() > 0.5 { 0.6 } else { 0.8 };
+            assert_eq!(face.tile, Tile::Stone);
+            assert_eq!(face.shade, expected_shade);
+            let top = face
+                .points
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::MIN, f32::max);
+            let bottom = face
+                .points
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::MAX, f32::min);
+            for (index, point) in face.points.iter().enumerate() {
+                let expected_v = if (point.y - top).abs() < 0.001 {
+                    0.0
+                } else {
+                    assert!((point.y - bottom).abs() < 0.001);
+                    1.0
+                };
+                assert_eq!(face.uv[index][1], expected_v);
+                assert!((0.0..=1.0).contains(&face.uv[index][0]));
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_occlusion_darkens_corners_next_to_a_neighbour() {
+        let dir = TempDir::new("mesh-ao");
+        let chunks = [(0, 0, chunk_tag(3953, 0, 0, vec![stone_section()]))];
+        write_world(dir.path(), &level_tag(3953, "Mesh"), &chunks).unwrap();
+        let mut world = World::open(dir.path()).unwrap();
+
+        // A block sitting on top of the surface shades the corners of the
+        // neighbouring top face that touch it.
+        let mut edits = EditMap::new();
+        edits.insert((8, 64, 8), BlockState::new("minecraft:oak_planks"));
+        let mesh = build_chunk_mesh(&mut world, 0, 0, &edits).unwrap().unwrap();
+        let face = mesh
+            .faces
+            .iter()
+            .find(|face| {
+                face.normal.y > 0.9
+                    && (face.center().x - 9.5).abs() < 0.01
+                    && (face.center().z - 8.5).abs() < 0.01
+            })
+            .expect("top face beside the placed block");
+
+        let occluded = face
+            .points
+            .iter()
+            .zip(face.light)
+            .filter(|(point, _)| (point.x - 9.0).abs() < 0.01)
+            .all(|(_, light)| (light - 0.8).abs() < 0.001);
+        assert!(occluded, "occluded corners: {:?}", face.light);
+        assert!(
+            face.light.iter().any(|light| (light - 1.0).abs() < 0.001),
+            "unoccluded corners keep full light: {:?}",
+            face.light
+        );
     }
 
     #[test]

@@ -1,27 +1,67 @@
 //! Render commands, a 2D camera, and the software backend.
 
+use std::sync::Arc;
+
 use rkb_core::{Rect, Vec2, Vec3};
 
-use crate::{Color, Framebuffer};
+use crate::{Color, Framebuffer, Texture};
 
 /// A projected triangle vertex for the depth-tested 3D path.
 ///
-/// `x` and `y` are framebuffer pixels, `depth` is normalized device Z in
-/// `[0, 1]` (lower is closer), and `inv_w` is the reciprocal clip-space `w`
-/// used for perspective-correct depth interpolation. The game is responsible
-/// for clipping triangles against the near plane before submitting them.
+/// `x` and `y` are framebuffer pixels and `inv_w` is the reciprocal clip-space
+/// `w`. Reciprocal depth increases towards the camera, so the backend keeps a
+/// `1/w` depth buffer: it is linear in screen space (no `z/w` precision cliff
+/// far from the near plane) and is also the weight needed for perspective
+/// correct UV/light interpolation. `depth` is the normalized device Z kept for
+/// diagnostics and tests; it is not the value compared in the depth buffer.
+/// The game clips triangles against the near plane before submitting them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vertex3D {
     pub x: f32,
     pub y: f32,
     pub depth: f32,
     pub inv_w: f32,
+    /// Atlas U coordinate, normalized to the whole atlas.
+    pub u: f32,
+    /// Atlas V coordinate, normalized to the whole atlas.
+    pub v: f32,
+    /// Per-vertex light multiplier (ambient occlusion combined with face shade).
+    pub light: f32,
 }
 
 impl Vertex3D {
     #[must_use]
     pub const fn new(x: f32, y: f32, depth: f32, inv_w: f32) -> Self {
-        Self { x, y, depth, inv_w }
+        Self {
+            x,
+            y,
+            depth,
+            inv_w,
+            u: 0.0,
+            v: 0.0,
+            light: 1.0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_attributes(
+        x: f32,
+        y: f32,
+        depth: f32,
+        inv_w: f32,
+        u: f32,
+        v: f32,
+        light: f32,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            depth,
+            inv_w,
+            u,
+            v,
+            light,
+        }
     }
 }
 
@@ -32,15 +72,15 @@ pub fn project_clip(clip: Vec3, w: f32, viewport: Vec2) -> Vertex3D {
     let ndc_x = clip.x * inv_w;
     let ndc_y = clip.y * inv_w;
     let ndc_z = clip.z * inv_w;
-    Vertex3D {
-        x: (ndc_x * 0.5 + 0.5) * viewport.x,
+    Vertex3D::new(
+        (ndc_x * 0.5 + 0.5) * viewport.x,
         // Framebuffer rows run top to bottom, clip-space Y runs bottom to top.
-        y: (0.5 - ndc_y * 0.5) * viewport.y,
+        (0.5 - ndc_y * 0.5) * viewport.y,
         // Clipping lands exactly on the near plane; rounding can put the
         // value a hair outside the unit range, so clamp it here.
-        depth: ((ndc_z + 1.0) * 0.5).clamp(0.0, 1.0),
+        ((ndc_z + 1.0) * 0.5).clamp(0.0, 1.0),
         inv_w,
-    }
+    )
 }
 
 /// A single draw operation.
@@ -78,6 +118,18 @@ pub enum DrawCommand {
         c: Vertex3D,
         color: Color,
     },
+    /// A depth-tested triangle sampling the draw list's texture atlas.
+    ///
+    /// The final pixel is `atlas(u, v) * tint * vertex_light`, blended towards
+    /// `fog_color` by `fog`. Texels with zero alpha are cut out.
+    TexturedTriangle3D {
+        a: Vertex3D,
+        b: Vertex3D,
+        c: Vertex3D,
+        tint: Color,
+        fog_color: Color,
+        fog: f32,
+    },
     GradientTriangle {
         a: Vec2,
         b: Vec2,
@@ -89,9 +141,13 @@ pub enum DrawCommand {
 }
 
 /// A frame's worth of interface-independent draw commands.
+///
+/// The optional atlas is shared by `Arc`, so attaching it to the list every
+/// frame does not copy the texture.
 #[derive(Clone, Debug, Default)]
 pub struct DrawList {
     clear: Color,
+    atlas: Option<Arc<Texture>>,
     commands: Vec<DrawCommand>,
 }
 
@@ -101,8 +157,19 @@ impl DrawList {
     pub fn new(clear: Color) -> Self {
         Self {
             clear,
+            atlas: None,
             commands: Vec::new(),
         }
+    }
+
+    /// Shares the texture atlas used by `TexturedTriangle3D` commands.
+    pub fn set_atlas(&mut self, atlas: Option<Arc<Texture>>) {
+        self.atlas = atlas;
+    }
+
+    #[must_use]
+    pub fn atlas(&self) -> Option<&Texture> {
+        self.atlas.as_deref()
     }
 
     #[must_use]
@@ -149,6 +216,46 @@ impl DrawList {
     /// Queues a depth-tested 3D triangle.
     pub fn triangle_3d(&mut self, a: Vertex3D, b: Vertex3D, c: Vertex3D, color: Color) {
         self.push(DrawCommand::Triangle3D { a, b, c, color });
+    }
+
+    /// Queues a depth-tested triangle textured from the current atlas.
+    pub fn textured_triangle_3d(
+        &mut self,
+        a: Vertex3D,
+        b: Vertex3D,
+        c: Vertex3D,
+        tint: Color,
+        fog_color: Color,
+        fog: f32,
+    ) {
+        self.push(DrawCommand::TexturedTriangle3D {
+            a,
+            b,
+            c,
+            tint,
+            fog_color,
+            fog: fog.clamp(0.0, 1.0),
+        });
+    }
+
+    /// Queues a screen-space triangle with per-vertex colours.
+    pub fn gradient_triangle(
+        &mut self,
+        a: Vec2,
+        b: Vec2,
+        c: Vec2,
+        color_a: Color,
+        color_b: Color,
+        color_c: Color,
+    ) {
+        self.push(DrawCommand::GradientTriangle {
+            a,
+            b,
+            c,
+            color_a,
+            color_b,
+            color_c,
+        });
     }
 
     #[must_use]
@@ -202,6 +309,7 @@ pub trait RenderBackend {
 #[derive(Debug)]
 pub struct SoftwareBackend {
     framebuffer: Framebuffer,
+    /// Reciprocal-depth (`1/w`) buffer. Larger is closer; cleared to zero.
     depth: Vec<f32>,
 }
 
@@ -212,7 +320,7 @@ impl SoftwareBackend {
         let height = height.max(1);
         Self {
             framebuffer: Framebuffer::new(width, height),
-            depth: vec![1.0; width as usize * height as usize],
+            depth: vec![0.0; width as usize * height as usize],
         }
     }
 }
@@ -223,13 +331,13 @@ impl RenderBackend for SoftwareBackend {
         let height = height.max(1);
         self.framebuffer.resize(width, height);
         self.depth.clear();
-        self.depth.resize(width as usize * height as usize, 1.0);
+        self.depth.resize(width as usize * height as usize, 0.0);
     }
 
     fn render(&mut self, list: &DrawList) -> Result<RenderStats, RenderError> {
         let framebuffer = &mut self.framebuffer;
         framebuffer.clear(list.clear_color());
-        self.depth.fill(1.0);
+        self.depth.fill(0.0);
         let mut stats = RenderStats::default();
 
         for command in list.commands() {
@@ -258,6 +366,27 @@ impl RenderBackend for SoftwareBackend {
                     rasterize_depth_triangle(framebuffer, &mut self.depth, a, b, c, color);
                     stats.triangles += 1;
                 }
+                DrawCommand::TexturedTriangle3D {
+                    a,
+                    b,
+                    c,
+                    tint,
+                    fog_color,
+                    fog,
+                } => {
+                    rasterize_textured_triangle(
+                        framebuffer,
+                        &mut self.depth,
+                        a,
+                        b,
+                        c,
+                        tint,
+                        fog_color,
+                        fog,
+                        list.atlas(),
+                    );
+                    stats.triangles += 1;
+                }
                 DrawCommand::GradientTriangle {
                     a,
                     b,
@@ -283,18 +412,23 @@ fn edge(a: Vertex3D, b: Vertex3D, px: f32, py: f32) -> f32 {
     (px - a.x) * (b.y - a.y) - (py - a.y) * (b.x - a.x)
 }
 
-/// Fills a triangle with perspective-correct depth testing.
+/// Fills a triangle with reciprocal-depth testing.
 ///
 /// The game submits triangles already clipped against the near plane and
 /// projected into screen space, so this routine only handles the viewport
-/// bounding box and the depth comparison.
-fn rasterize_depth_triangle(
+/// bounding box and the depth comparison. `atlas` selects the textured path;
+/// when it is `None`, `tint` is used directly.
+#[allow(clippy::too_many_arguments)]
+fn rasterize_triangle(
     framebuffer: &mut Framebuffer,
     depth: &mut [f32],
     a: Vertex3D,
     b: Vertex3D,
     c: Vertex3D,
-    color: Color,
+    tint: Color,
+    fog_color: Color,
+    fog: f32,
+    atlas: Option<&Texture>,
 ) {
     let width = framebuffer.width() as i32;
     let height = framebuffer.height() as i32;
@@ -314,6 +448,7 @@ fn rasterize_depth_triangle(
     }
 
     let inverse_area = 1.0 / area;
+    let fog = fog.clamp(0.0, 1.0);
     let pixels = framebuffer.pixels_mut();
     for y in min_y..max_y as i32 {
         let py = y as f32 + 0.5;
@@ -333,26 +468,95 @@ fn rasterize_depth_triangle(
             let l0 = w0 * inverse_area;
             let l1 = w1 * inverse_area;
             let l2 = w2 * inverse_area;
+            // Reciprocal depth is linear in screen space, so interpolating it
+            // with barycentrics is exact. Larger is closer.
             let inv_w = l0 * a.inv_w + l1 * b.inv_w + l2 * c.inv_w;
-            let z = if inv_w.abs() > f32::EPSILON {
-                (l0 * a.depth * a.inv_w + l1 * b.depth * b.inv_w + l2 * c.depth * c.inv_w) / inv_w
-            } else {
-                l0 * a.depth + l1 * b.depth + l2 * c.depth
-            };
-            if !(0.0..=1.0).contains(&z) {
+            if inv_w <= 0.0 {
                 continue;
             }
             let index = y as usize * width as usize + x as usize;
-            if z < depth[index] {
-                depth[index] = z;
-                let offset = index * 4;
-                pixels[offset] = color.r;
-                pixels[offset + 1] = color.g;
-                pixels[offset + 2] = color.b;
-                pixels[offset + 3] = 255;
+            if inv_w <= depth[index] {
+                continue;
             }
+
+            let (red, green, blue) = if let Some(atlas) = atlas {
+                let inv = 1.0 / inv_w;
+                let u = (l0 * a.u * a.inv_w + l1 * b.u * b.inv_w + l2 * c.u * c.inv_w) * inv;
+                let v = (l0 * a.v * a.inv_w + l1 * b.v * b.inv_w + l2 * c.v * c.inv_w) * inv;
+                let light =
+                    (l0 * a.light * a.inv_w + l1 * b.light * b.inv_w + l2 * c.light * c.inv_w)
+                        * inv;
+                let texel = atlas.sample_nearest(u, v);
+                if texel.a == 0 {
+                    continue;
+                }
+                let light = light.clamp(0.0, 1.5);
+                let scale = |channel: u8, tint: u8| -> f32 {
+                    f32::from(channel) * f32::from(tint) / 255.0 * light
+                };
+                (
+                    scale(texel.r, tint.r),
+                    scale(texel.g, tint.g),
+                    scale(texel.b, tint.b),
+                )
+            } else {
+                (f32::from(tint.r), f32::from(tint.g), f32::from(tint.b))
+            };
+
+            let (red, green, blue) = if fog > 0.0 {
+                let mix = |near: f32, far: u8| -> u8 {
+                    (near + (f32::from(far) - near) * fog)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                (
+                    mix(red, fog_color.r),
+                    mix(green, fog_color.g),
+                    mix(blue, fog_color.b),
+                )
+            } else {
+                (
+                    red.round().clamp(0.0, 255.0) as u8,
+                    green.round().clamp(0.0, 255.0) as u8,
+                    blue.round().clamp(0.0, 255.0) as u8,
+                )
+            };
+
+            depth[index] = inv_w;
+            let offset = index * 4;
+            pixels[offset] = red;
+            pixels[offset + 1] = green;
+            pixels[offset + 2] = blue;
+            pixels[offset + 3] = 255;
         }
     }
+}
+
+fn rasterize_depth_triangle(
+    framebuffer: &mut Framebuffer,
+    depth: &mut [f32],
+    a: Vertex3D,
+    b: Vertex3D,
+    c: Vertex3D,
+    color: Color,
+) {
+    rasterize_triangle(framebuffer, depth, a, b, c, color, color, 0.0, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rasterize_textured_triangle(
+    framebuffer: &mut Framebuffer,
+    depth: &mut [f32],
+    a: Vertex3D,
+    b: Vertex3D,
+    c: Vertex3D,
+    tint: Color,
+    fog_color: Color,
+    fog: f32,
+    atlas: Option<&Texture>,
+) {
+    // Without an attached atlas the flat tint keeps the command meaningful.
+    rasterize_triangle(framebuffer, depth, a, b, c, tint, fog_color, fog, atlas);
 }
 
 /// A 2D camera that maps world coordinates to viewport pixels.
@@ -413,6 +617,7 @@ impl Camera2D {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn software_backend_executes_commands() {
@@ -467,11 +672,14 @@ mod tests {
         assert!(list.is_empty());
     }
 
-    fn full_screen_triangle(depth: f32) -> (Vertex3D, Vertex3D, Vertex3D) {
+    fn full_screen_triangle(inv_w: f32) -> (Vertex3D, Vertex3D, Vertex3D) {
+        // NDC depth is reported alongside reciprocal depth; the backend tests
+        // the reciprocal value, which is larger for nearer geometry.
+        let depth = 1.0 - inv_w * 0.5;
         (
-            Vertex3D::new(0.0, 0.0, depth, 1.0),
-            Vertex3D::new(16.0, 0.0, depth, 1.0),
-            Vertex3D::new(0.0, 16.0, depth, 1.0),
+            Vertex3D::new(0.0, 0.0, depth, inv_w),
+            Vertex3D::new(16.0, 0.0, depth, inv_w),
+            Vertex3D::new(0.0, 16.0, depth, inv_w),
         )
     }
 
@@ -480,9 +688,9 @@ mod tests {
         for order in [true, false] {
             let mut backend = SoftwareBackend::new(16, 16);
             let mut list = DrawList::new(Color::BLACK);
-            let (a, b, c) = full_screen_triangle(0.8);
+            let (a, b, c) = full_screen_triangle(0.5);
             let far = [a, b, c];
-            let (a, b, c) = full_screen_triangle(0.2);
+            let (a, b, c) = full_screen_triangle(2.0);
             let near = [a, b, c];
             let (first, first_color, second, second_color) = if order {
                 (far, Color::BLUE, near, Color::RED)
@@ -505,24 +713,124 @@ mod tests {
     fn depth_buffer_is_cleared_each_frame_and_on_resize() {
         let mut backend = SoftwareBackend::new(8, 8);
         let mut list = DrawList::new(Color::BLACK);
-        let (a, b, c) = full_screen_triangle(0.5);
+        let (a, b, c) = full_screen_triangle(1.0);
         list.triangle_3d(a, b, c, Color::GREEN);
         backend.render(&list).unwrap();
         assert_eq!(backend.framebuffer().pixel(1, 1), Some(Color::GREEN));
 
         list.clear_commands();
         list.set_clear_color(Color::BLACK);
-        let (a, b, c) = full_screen_triangle(0.9);
+        let (a, b, c) = full_screen_triangle(0.1);
         list.triangle_3d(a, b, c, Color::BLUE);
         backend.render(&list).unwrap();
         assert_eq!(backend.framebuffer().pixel(1, 1), Some(Color::BLUE));
 
         backend.resize(4, 4);
-        let (a, b, c) = full_screen_triangle(0.9);
+        let (a, b, c) = full_screen_triangle(0.1);
         list.clear_commands();
         list.triangle_3d(a, b, c, Color::YELLOW);
         backend.render(&list).unwrap();
         assert_eq!(backend.framebuffer().pixel(1, 1), Some(Color::YELLOW));
+    }
+
+    #[test]
+    fn textured_triangles_sample_the_attached_atlas() {
+        // Two texels: red on the left, blue on the right.
+        let mut texels = Vec::new();
+        texels.extend_from_slice(&[255, 0, 0, 255]);
+        texels.extend_from_slice(&[0, 0, 255, 255]);
+        let atlas = Arc::new(Texture::from_rgba(2, 1, texels));
+
+        let mut backend = SoftwareBackend::new(16, 8);
+        let mut list = DrawList::new(Color::BLACK);
+        list.set_atlas(Some(Arc::clone(&atlas)));
+        let a = Vertex3D::with_attributes(0.0, 0.0, 0.5, 1.0, 0.01, 0.5, 1.0);
+        let b = Vertex3D::with_attributes(16.0, 0.0, 0.5, 1.0, 0.99, 0.5, 1.0);
+        let c = Vertex3D::with_attributes(0.0, 8.0, 0.5, 1.0, 0.01, 0.5, 1.0);
+        list.textured_triangle_3d(a, b, c, Color::WHITE, Color::BLACK, 0.0);
+        backend.render(&list).unwrap();
+
+        assert_eq!(
+            backend.framebuffer().pixel(1, 1),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(
+            backend.framebuffer().pixel(12, 1),
+            Some(Color::rgb(0, 0, 255))
+        );
+    }
+
+    #[test]
+    fn textured_triangles_apply_light_and_fog() {
+        let mut texels = Vec::new();
+        texels.extend_from_slice(&[255, 255, 255, 255]);
+        let atlas = Arc::new(Texture::from_rgba(1, 1, texels));
+        let mut backend = SoftwareBackend::new(8, 8);
+        let mut list = DrawList::new(Color::BLACK);
+        list.set_atlas(Some(atlas));
+        let a = Vertex3D::with_attributes(0.0, 0.0, 0.5, 1.0, 0.5, 0.5, 0.5);
+        let b = Vertex3D::with_attributes(8.0, 0.0, 0.5, 1.0, 0.5, 0.5, 0.5);
+        let c = Vertex3D::with_attributes(0.0, 8.0, 0.5, 1.0, 0.5, 0.5, 0.5);
+        list.textured_triangle_3d(a, b, c, Color::WHITE, Color::BLACK, 0.0);
+        backend.render(&list).unwrap();
+        // White * 0.5 light = 128.
+        assert_eq!(
+            backend.framebuffer().pixel(1, 1),
+            Some(Color::rgb(128, 128, 128))
+        );
+
+        list.clear_commands();
+        let a = Vertex3D::with_attributes(0.0, 0.0, 0.5, 1.0, 0.5, 0.5, 1.0);
+        let b = Vertex3D::with_attributes(8.0, 0.0, 0.5, 1.0, 0.5, 0.5, 1.0);
+        let c = Vertex3D::with_attributes(0.0, 8.0, 0.5, 1.0, 0.5, 0.5, 1.0);
+        list.textured_triangle_3d(a, b, c, Color::WHITE, Color::BLACK, 1.0);
+        backend.render(&list).unwrap();
+        assert_eq!(backend.framebuffer().pixel(1, 1), Some(Color::BLACK));
+    }
+
+    #[test]
+    fn coplanar_quads_leave_no_holes_at_their_shared_edge() {
+        // A top face and a side face meeting along one edge, as in a terrain
+        // step. Reciprocal depth must not let the seam punch background
+        // through the geometry.
+        let mut backend = SoftwareBackend::new(32, 32);
+        let mut list = DrawList::new(Color::rgb(255, 0, 255));
+        let top = (
+            Vertex3D::new(0.0, 8.0, 0.5, 0.25),
+            Vertex3D::new(32.0, 8.0, 0.5, 0.25),
+            Vertex3D::new(0.0, 16.0, 0.5, 0.5),
+        );
+        let side = (
+            Vertex3D::new(0.0, 16.0, 0.5, 0.5),
+            Vertex3D::new(32.0, 16.0, 0.5, 0.5),
+            Vertex3D::new(0.0, 24.0, 0.5, 1.0),
+        );
+        list.triangle_3d(top.0, top.1, top.2, Color::WHITE);
+        list.triangle_3d(side.0, side.1, side.2, Color::GREEN);
+        // The other halves of the two quads.
+        list.triangle_3d(
+            top.1,
+            top.2,
+            Vertex3D::new(32.0, 16.0, 0.5, 0.5),
+            Color::WHITE,
+        );
+        list.triangle_3d(
+            side.1,
+            side.2,
+            Vertex3D::new(32.0, 24.0, 0.5, 1.0),
+            Color::GREEN,
+        );
+        backend.render(&list).unwrap();
+        let magenta = Color::rgb(255, 0, 255);
+        for y in 9..24 {
+            for x in 1..31 {
+                assert_ne!(
+                    backend.framebuffer().pixel(x, y),
+                    Some(magenta),
+                    "hole at ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -7,12 +7,13 @@
 //! - Opens a user-supplied 1.21 save, or creates a deterministic generated
 //!   world when no save exists. The generated world is the default game.
 //! - Streams chunks from a region save or a background terrain worker, meshes
-//!   real block data, culls hidden faces, and renders with flat placeholder
-//!   colours (no Mojang textures).
+//!   real block data, culls hidden faces, and renders with a procedural
+//!   original texture atlas (no Mojang textures), directional face shading,
+//!   per-vertex ambient occlusion, and distance fog.
 //! - Supports walking, jumping, collision, creative flight, touch look,
 //!   raycast block breaking and placing, and persistent seed/player/edits.
-//! - Does not implement inventory, crafting, mobs, survival, lighting, or
-//!   multiplayer.
+//! - Does not implement inventory, crafting, mobs, survival, dynamic lighting,
+//!   or multiplayer.
 //!
 //! No Minecraft assets, code, or world data are bundled. Generated terrain is
 //! produced entirely by RKB code from a seed.
@@ -33,6 +34,7 @@ use crate::interaction::{raycast, RayHit};
 use crate::mesh::{build_chunk_mesh, is_solid_block, ChunkMesh, EditMap};
 use crate::player::{BlockQuery, MoveInput, Player};
 use crate::session::{self, PlayerSnapshot, Session};
+use crate::textures::BlockAtlas;
 use crate::world_source::{WorldKind, WorldState};
 use crate::worldgen::{DEFAULT_SEED, WORLD_MIN_Y};
 
@@ -48,6 +50,9 @@ pub const REACH: f32 = 5.0;
 const AUTOSAVE_SECONDS: f32 = 20.0;
 /// The playable world border used by current Java Edition worlds.
 const WORLD_BORDER: f32 = 29_999_984.0;
+/// Distance fog blends terrain into the sky between these distances (blocks).
+const FOG_START: f32 = 36.0;
+const FOG_END: f32 = 64.0;
 
 const SKY_ZENITH: Color = Color::rgb(58, 108, 196);
 const SKY_HORIZON: Color = Color::rgb(171, 208, 240);
@@ -120,6 +125,8 @@ pub struct MinecraftGame {
     save_clock: f32,
     save_dirty: bool,
     last_error: Option<String>,
+    /// Procedural block atlas shared with the draw list each frame.
+    atlas: BlockAtlas,
 }
 
 impl MinecraftGame {
@@ -159,6 +166,7 @@ impl MinecraftGame {
             save_clock: 0.0,
             save_dirty: false,
             last_error: None,
+            atlas: BlockAtlas::new(),
         };
         game.layout(viewport);
         match world_path {
@@ -784,20 +792,24 @@ impl MinecraftGame {
     fn draw_sky(&self, list: &mut DrawList) {
         let viewport = self.viewport;
         let horizon_y = viewport.y * 0.62;
-        let strips = 8;
-        let strip_height = horizon_y / strips as f32;
-        for strip in 0..strips {
-            let t = strip as f32 / (strips - 1) as f32;
-            list.rect(
-                Rect::new(
-                    0.0,
-                    strip as f32 * strip_height,
-                    viewport.x,
-                    strip_height + 1.0,
-                ),
-                SKY_ZENITH.lerp(SKY_HORIZON, t),
-            );
-        }
+        // Smooth zenith-to-horizon gradient. Flat horizontal strips were
+        // visible as banding on high-resolution displays.
+        list.gradient_triangle(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(viewport.x, 0.0),
+            Vec2::new(viewport.x, horizon_y),
+            SKY_ZENITH,
+            SKY_ZENITH,
+            SKY_HORIZON,
+        );
+        list.gradient_triangle(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(viewport.x, horizon_y),
+            Vec2::new(0.0, horizon_y),
+            SKY_ZENITH,
+            SKY_HORIZON,
+            SKY_HORIZON,
+        );
         list.rect(
             Rect::new(
                 0.0,
@@ -818,6 +830,7 @@ impl MinecraftGame {
         let mut out = [Vertex3D::new(0.0, 0.0, 1.0, 1.0); 8];
         let mut triangles = 0_u32;
         let mut visible_chunks = 0_usize;
+        let atlas = &self.atlas;
 
         for mesh in self.meshes.values() {
             if mesh.faces.is_empty() || !frustum.contains_aabb(mesh.min, mesh.max) {
@@ -828,16 +841,35 @@ impl MinecraftGame {
                 if !face.is_visible_from(eye) {
                     continue;
                 }
-                let count =
-                    camera.project_polygon(view_projection, viewport, &face.points, &mut out);
+                let rect = atlas.uv(face.tile);
+                let uvs = face.uv.map(|[u, v]| {
+                    [
+                        rect[0] + u * (rect[2] - rect[0]),
+                        rect[1] + v * (rect[3] - rect[1]),
+                    ]
+                });
+                let count = camera.project_polygon_textured(
+                    view_projection,
+                    viewport,
+                    &face.points,
+                    &uvs,
+                    &face.light,
+                    &mut out,
+                );
                 if count < 3 {
                     continue;
                 }
                 let distance = (face.center() - eye).length();
-                let fog = ((distance - 48.0) / 128.0).clamp(0.0, 0.6);
-                let color = face.color.lerp(SKY_HORIZON, fog);
+                let fog = ((distance - FOG_START) / (FOG_END - FOG_START)).clamp(0.0, 1.0);
                 for index in 1..count - 1 {
-                    list.triangle_3d(out[0], out[index], out[index + 1], color);
+                    list.textured_triangle_3d(
+                        out[0],
+                        out[index],
+                        out[index + 1],
+                        face.tint,
+                        SKY_HORIZON,
+                        fog,
+                    );
                     triangles = triangles.saturating_add(1);
                 }
             }
@@ -987,6 +1019,7 @@ impl Game for MinecraftGame {
         if (self.viewport - viewport).length_squared() > 0.01 {
             self.layout(viewport);
         }
+        list.set_atlas(Some(self.atlas.texture()));
         self.draw_sky(list);
         if self.world.is_some() {
             self.draw_scene(list);
@@ -1151,7 +1184,7 @@ mod tests {
         assert!(!list
             .commands()
             .iter()
-            .any(|command| matches!(command, DrawCommand::Triangle3D { .. })));
+            .any(|command| matches!(command, DrawCommand::TexturedTriangle3D { .. })));
     }
 
     #[test]
@@ -1194,10 +1227,17 @@ mod tests {
         game.set_look(0.0, -0.5);
         let mut list = DrawList::new(SKY_HORIZON);
         game.render(&mut list, Vec2::new(640.0, 360.0));
+        assert!(list.atlas().is_some(), "renderer needs the block atlas");
+        assert!(
+            list.commands()
+                .iter()
+                .any(|command| matches!(command, DrawCommand::GradientTriangle { .. })),
+            "sky should be a smooth gradient, not flat strips"
+        );
         let triangles = list
             .commands()
             .iter()
-            .filter(|command| matches!(command, DrawCommand::Triangle3D { .. }))
+            .filter(|command| matches!(command, DrawCommand::TexturedTriangle3D { .. }))
             .count();
         assert!(triangles > 10, "only {triangles} triangles submitted");
         assert_eq!(game.stats().triangles as usize, triangles);
