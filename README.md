@@ -30,7 +30,7 @@ procedurally by RKB code.
 
 | Area | State |
 | --- | --- |
-| Rust workspace | Building on stable Rust; 252 unit/integration tests |
+| Rust workspace | Building on stable Rust; 253 unit/integration tests |
 | Renderer | Software RGBA8 rasterizer with primitives, alpha blending, a 2D camera, texture sampling, and a reciprocal-depth perspective 3D path with per-vertex UV/light |
 | Runtime | Fixed timestep, accumulation and drop accounting, lifecycle FSM, resize handling |
 | Input | Multi-touch state, tap/drag/pinch detectors, virtual joystick, touch button |

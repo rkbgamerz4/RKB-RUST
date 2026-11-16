@@ -2,6 +2,12 @@
 
 use crate::error::{Error, Result};
 
+/// Java counts `String.length()` in UTF-16 code units, not Unicode scalars.
+/// Minecraft's string limits use that count.
+fn utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
 /// A cursor over one packet body or frame.
 #[derive(Clone, Debug)]
 pub struct Reader<'a> {
@@ -147,9 +153,9 @@ impl<'a> Reader<'a> {
         Ok(u128::from_be_bytes(value))
     }
 
-    /// Reads a length-prefixed UTF-8 string whose **character** count is at
-    /// most `max_chars`. The encoded byte length is checked against
-    /// `max_chars * 3`, as vanilla does.
+    /// Reads a length-prefixed UTF-8 string whose **UTF-16 code unit** count is
+    /// at most `max_chars` (matching Java's `String.length()`). The encoded
+    /// byte length is checked against `max_chars * 3`, as vanilla does.
     pub fn read_string(&mut self, max_chars: usize) -> Result<String> {
         let length = self.read_varint()?;
         if length < 0 {
@@ -165,9 +171,10 @@ impl<'a> Reader<'a> {
         }
         let bytes = self.read_bytes(length)?;
         let value = std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)?;
-        if value.chars().count() > max_chars {
+        let chars = utf16_len(value);
+        if chars > max_chars {
             return Err(Error::StringTooLong {
-                length: value.chars().count(),
+                length: chars,
                 max: max_chars,
             });
         }
@@ -316,10 +323,10 @@ impl Writer {
 
     /// Writes a length-prefixed UTF-8 string, checking the character limit.
     pub fn write_string(&mut self, value: &str, max_chars: usize) -> Result<()> {
-        let chars = value.chars().count();
+        let chars = utf16_len(value);
         if chars > max_chars || value.len() > max_chars.saturating_mul(3) {
             return Err(Error::StringTooLong {
-                length: chars.max(value.len()),
+                length: chars,
                 max: max_chars,
             });
         }
@@ -438,6 +445,21 @@ mod tests {
         assert_eq!(reader.read_string(3).unwrap(), "ééé");
         let mut reader = Reader::new(writer.as_slice());
         assert!(reader.read_string(2).is_err());
+    }
+
+    #[test]
+    fn string_limits_count_utf16_code_units() {
+        // "😀a" is five UTF-8 bytes but three UTF-16 code units.
+        assert!(utf16_len("😀a") == 3);
+        let mut writer = Writer::new();
+        assert!(writer.write_string("😀a", 2).is_err());
+        assert!(writer.write_string("😀a", 3).is_ok());
+
+        let bytes = [5, 0xF0, 0x9F, 0x98, 0x80, b'a'];
+        let mut reader = Reader::new(&bytes);
+        assert!(reader.read_string(2).is_err());
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.read_string(3).unwrap(), "😀a");
     }
 
     #[test]
