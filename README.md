@@ -6,29 +6,38 @@ ARM64**, with a headless CLI demo and a native Android host.
 The project currently ships a deterministic software renderer, fixed-timestep
 runtime, touch/gesture input, a path-safe asset system with a custom `RKBPAK1`
 archive format, and a JNI bridge that presents frames through a Kotlin
-`SurfaceView`. It also contains the **first playable milestone of a Minecraft:
-Java Edition 1.21 client**: the app creates a deterministic generated world on
-first launch (or reads a user-supplied 1.21 save), streams and meshes chunks,
-renders textured block geometry with a first-person camera and collision, supports
-touch movement plus block breaking/placing, and persists seed, player pose, and
-edits.
+`SurfaceView`. It also contains a **voxel prototype** that reads a user-supplied
+Minecraft: Java Edition 1.21/1.21.1 save (or creates RKB-authored terrain),
+streams and meshes chunks, renders textured block geometry with a first-person
+camera and collision, supports touch movement plus block breaking/placing, and
+persists seed, player pose, and edits.
 
-This is not a complete Minecraft client. There are no Mojang textures or
-resource packs, dynamic lightmaps or shadows, inventory, mobs, survival, or
-networking yet. The project contains no Minecraft assets, jars, or game files;
-block textures are generated procedurally by RKB code.
+> **Direction change (2026-11-16).** The voxel prototype is a foundation, not the
+> product. The target is a genuine Minecraft: Java Edition client with protocol,
+> Microsoft authentication, vanilla-server multiplayer, client worlds, entities,
+> inventory, and a GPU renderer. See [`docs/audit-current.md`](docs/audit-current.md),
+> [`docs/horizon-comparison.md`](docs/horizon-comparison.md), and
+> [`docs/migration-plan.md`](docs/migration-plan.md). New protocol work lives on
+> `feature/mc-java-protocol`.
+
+This is not a complete Minecraft client. It does not yet speak the Minecraft
+protocol, sign in, or join a server; there are no Mojang textures or resource
+packs, dynamic lightmaps or shadows, inventory, mobs, or survival. The project
+contains no Minecraft assets, jars, or game files; block textures are generated
+procedurally by RKB code.
 
 ## Status
 
 | Area | State |
 | --- | --- |
-| Rust workspace | Building on stable Rust; 212 unit/integration tests |
+| Rust workspace | Building on stable Rust; 252 unit/integration tests |
 | Renderer | Software RGBA8 rasterizer with primitives, alpha blending, a 2D camera, texture sampling, and a reciprocal-depth perspective 3D path with per-vertex UV/light |
 | Runtime | Fixed timestep, accumulation and drop accounting, lifecycle FSM, resize handling |
 | Input | Multi-touch state, tap/drag/pinch detectors, virtual joystick, touch button |
 | Resources | Traversal-safe paths, memory/file sources, checksummed `RKBPAK1` archives, LRU cache |
 | Minecraft data | 1.21/1.21.1 saved-world reader and atomic writer: NBT, Anvil regions, chunk palettes and construction, block states, registry reports, `rkb-world` CLI |
-| Minecraft client | `rkb-minecraft`: default seeded terrain, save loading, background chunk streaming and face meshing, textured block rendering from a procedural atlas with face shading and ambient occlusion, first-person camera, walking/jumping/flight, AABB collision, raycast break/place, session persistence and autosave |
+| Minecraft protocol | `rkb-proto`: 1.21.1 (protocol 767) primitive codecs, framing, zlib, handshake/status/login packets, typed status JSON, and a mock-tested server-list ping. No login, authentication, or server join yet |
+| Minecraft client | `rkb-minecraft`: default seeded terrain, save loading, background chunk streaming and face meshing, textured block rendering from a procedural atlas with face shading and ambient occlusion, first-person camera, walking/jumping/flight, AABB collision, raycast break/place, session persistence and autosave. This is the prototype being migrated |
 | Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host that launches the Minecraft client, 0.6x render scaling, status/help overlay, lifecycle and touch wiring |
 | CI | Format, clippy, tests, release build, generated and saved world renders, NDK ARM64 build, APK and ABI verification, emulator fresh-install and supplied-save assertions |
 

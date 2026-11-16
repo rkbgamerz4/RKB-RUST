@@ -217,6 +217,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rkb-proto"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde_json",
+]
+
+[[package]]
 name = "rkb-render"
 version = "0.1.0"
 dependencies = [
