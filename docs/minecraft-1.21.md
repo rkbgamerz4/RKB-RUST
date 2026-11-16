@@ -402,6 +402,13 @@ The sky is a smooth gradient and distance fog reaches full strength.
 No Mojang asset, atlas, or resource-pack data is bundled or copied; every texel
 is produced by deterministic RKB code.
 
+Note on snowy terrain: the generated snow biome is a heightmap of 1-block
+terraces. Where a terrace edge runs away from the camera, its east/west side
+faces project as tapering grey wedges (snow texels × the standard 0.6 face shade
+and corner ambient occlusion). Pixel checks confirm these are real, textured side
+faces rather than mesh holes or missing triangles; a slightly downward camera
+angle shows the white top faces instead.
+
 Next: loading a user's resource pack, biome tint blending, transparent and
 non-cube block models (slabs, stairs, fences), lightmap sampling, and
 memory/frame budgets for low/mid-range phones.
