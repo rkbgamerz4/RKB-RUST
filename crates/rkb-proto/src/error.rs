@@ -27,6 +27,8 @@ pub enum Error {
     Compression { message: String },
     /// An I/O operation failed.
     Io { message: String },
+    /// The operating system's random source failed.
+    Random { message: String },
     /// The peer sent a value the protocol does not allow.
     Protocol { message: String },
     /// The status JSON was malformed.
@@ -54,6 +56,14 @@ impl Error {
     #[must_use]
     pub fn io(message: impl Into<String>) -> Self {
         Self::Io {
+            message: message.into(),
+        }
+    }
+
+    /// A random-source failure with a human-readable explanation.
+    #[must_use]
+    pub fn random(message: impl Into<String>) -> Self {
+        Self::Random {
             message: message.into(),
         }
     }
@@ -86,6 +96,7 @@ impl fmt::Display for Error {
             }
             Self::Compression { message } => write!(f, "compression error: {message}"),
             Self::Io { message } => write!(f, "I/O error: {message}"),
+            Self::Random { message } => write!(f, "random source error: {message}"),
             Self::Protocol { message } => write!(f, "protocol error: {message}"),
             Self::Json { message } => write!(f, "status JSON error: {message}"),
         }

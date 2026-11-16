@@ -1,0 +1,21 @@
+[package]
+name = "rkb-net"
+description = "Minecraft: Java Edition 1.21.1 connection, login, and configuration state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rkb-login"
+path = "src/bin/rkb-login.rs"
+
+[dependencies]
+rkb-proto = { workspace = true }
+rkb-mc = { workspace = true }
+serde_json = "1.0"
+
+[lints]
+workspace = true

@@ -7,8 +7,9 @@
 //! - [`codec`]: VarInt/VarLong, strings, UUIDs, and the other primitive types.
 //! - [`frame`]: the length-prefixed frame and zlib compression above a
 //!   threshold.
-//! - [`packets`]: typed handshake, status, and login packets for one pinned
-//!   protocol version.
+//! - [`packets`]: typed handshake, status, login, and configuration packets
+//!   for one pinned protocol version.
+//! - [`crypto`]: AES/CFB8, RSA/PKCS#1 v1.5, SHA-1, and the server hash.
 //! - [`status`]: a typed view of the server-list status JSON.
 //! - [`client`]: a blocking server-list ping.
 //!
@@ -23,6 +24,7 @@
 
 pub mod client;
 pub mod codec;
+pub mod crypto;
 pub mod error;
 pub mod frame;
 pub mod ids;
@@ -40,3 +42,10 @@ pub const GAME_VERSION: &str = "1.21.1";
 
 /// `SharedConstants.getProtocolVersion()` for [`GAME_VERSION`].
 pub const PROTOCOL_VERSION: i32 = 767;
+
+/// `WorldVersion.dataVersion()` for [`GAME_VERSION`].
+///
+/// This must stay equal to the DataVersion `rkb-mc` verifies for the same
+/// release; a protocol and a world-format claim for one version cannot drift
+/// apart.
+pub const DATA_VERSION: i32 = 3955;

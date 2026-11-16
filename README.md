@@ -16,27 +16,29 @@ persists seed, player pose, and edits.
 > product. The target is a genuine Minecraft: Java Edition client with protocol,
 > Microsoft authentication, vanilla-server multiplayer, client worlds, entities,
 > inventory, and a GPU renderer. See [`docs/audit-current.md`](docs/audit-current.md),
-> [`docs/horizon-comparison.md`](docs/horizon-comparison.md), and
-> [`docs/migration-plan.md`](docs/migration-plan.md). New protocol work lives on
-> `feature/mc-java-protocol`.
+> [`docs/horizon-comparison.md`](docs/horizon-comparison.md),
+> [`docs/migration-plan.md`](docs/migration-plan.md), and
+> [`docs/m1-verification.md`](docs/m1-verification.md). New protocol work lives
+> on `feature/mc-java-protocol`.
 
-This is not a complete Minecraft client. It does not yet speak the Minecraft
-protocol, sign in, or join a server; there are no Mojang textures or resource
-packs, dynamic lightmaps or shadows, inventory, mobs, or survival. The project
-contains no Minecraft assets, jars, or game files; block textures are generated
+This is not a complete Minecraft client. It speaks the 1.21.1 status, login,
+and configuration protocol, but does not yet authenticate with Microsoft, enter
+the play state, or join a world. There are no Mojang textures or resource packs,
+dynamic lightmaps or shadows, inventory, mobs, or survival. The project contains
+no Minecraft assets, jars, or game files; block textures are generated
 procedurally by RKB code.
 
 ## Status
 
 | Area | State |
 | --- | --- |
-| Rust workspace | Building on stable Rust; 253 unit/integration tests |
+| Rust workspace | Building on stable Rust; 309 unit/integration tests |
 | Renderer | Software RGBA8 rasterizer with primitives, alpha blending, a 2D camera, texture sampling, and a reciprocal-depth perspective 3D path with per-vertex UV/light |
 | Runtime | Fixed timestep, accumulation and drop accounting, lifecycle FSM, resize handling |
 | Input | Multi-touch state, tap/drag/pinch detectors, virtual joystick, touch button |
 | Resources | Traversal-safe paths, memory/file sources, checksummed `RKBPAK1` archives, LRU cache |
 | Minecraft data | 1.21/1.21.1 saved-world reader and atomic writer: NBT, Anvil regions, chunk palettes and construction, block states, registry reports, `rkb-world` CLI |
-| Minecraft protocol | `rkb-proto`: 1.21.1 (protocol 767) primitive codecs, framing, zlib, handshake/status/login packets, typed status JSON, and a mock-tested server-list ping. No login, authentication, or server join yet |
+| Minecraft protocol | `rkb-proto` + `rkb-net`: 1.21.1 (protocol 767) codecs, framing, zlib, AES/CFB8, RSA/PKCS#1 v1.5, Java server hash, handshake/status/login/configuration packets, and an offline-mode login through `FinishConfiguration`, verified against the official 1.21.1 server. Microsoft authentication (M2) and the play state are not implemented |
 | Minecraft client | `rkb-minecraft`: default seeded terrain, save loading, background chunk streaming and face meshing, textured block rendering from a procedural atlas with face shading and ambient occlusion, first-person camera, walking/jumping/flight, AABB collision, raycast break/place, session persistence and autosave. This is the prototype being migrated |
 | Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host that launches the Minecraft client, 0.6x render scaling, status/help overlay, lifecycle and touch wiring |
 | CI | Format, clippy, tests, release build, generated and saved world renders, NDK ARM64 build, APK and ABI verification, emulator fresh-install and supplied-save assertions |
@@ -140,6 +142,40 @@ RKB_RENDER_OUT=/tmp/rkb-demo.ppm \
 RKB_RENDER_OUT=/tmp/rkb-generated.ppm \
   cargo test -p rkb-minecraft --test generated_render -- --nocapture
 ```
+
+## Minecraft 1.21.1 network (M1)
+
+`rkb-proto` and `rkb-net` implement the protocol-767 path from handshake to the
+end of configuration:
+
+- AES-128/CFB8 with separate cipher states per direction, RSA/X.509 parsing and
+  PKCS#1 v1.5 encryption, and the Java signed-hex server hash.
+- Compression activation through `SetCompression`, with threshold enforcement
+  and zlib validation.
+- Login (`LoginStart`, encryption request/response, plugin and cookie requests,
+  login success, login acknowledged) and configuration (client information,
+  known packs, registry data, tags, feature flags, keep-alive, ping,
+  `FinishConfiguration`).
+- Typed disconnect reasons: JSON in login, anonymous network NBT in
+  configuration.
+
+The offline-mode path was verified against the official Mojang 1.21.1 server:
+the server logged `RKBTest joined the game` after the client finished
+configuration. The client then disconnects intentionally because M1 does not
+decode play packets. See [`docs/m1-verification.md`](docs/m1-verification.md)
+for the exact evidence and limits.
+
+```bash
+# against an offline-mode server you are allowed to run
+cargo run -p rkb-net --bin rkb-login -- 127.0.0.1:25565 Steve
+
+cargo test -p rkb-proto
+cargo test -p rkb-net
+```
+
+Online-mode servers require Microsoft authentication. M1 fails explicitly when
+a server requests it; it does not fake a session or store credentials. That
+flow is the M2 gate.
 
 ## Minecraft 1.21 world inspection
 

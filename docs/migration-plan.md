@@ -154,6 +154,9 @@ Each gate says what must be **observed**, not merely written.
 
 ### M1 — Login and configuration against a test server
 
+Status: **complete for offline mode** (2026-11-16). Evidence and limits are in
+[`m1-verification.md`](m1-verification.md). Online-mode join remains an M2 gate.
+
 - AES/CFB8, RSA PKCS#1 v1.5, server hash, encryption request/response.
 - Compression threshold activation and enforcement.
 - Login success, login acknowledged, configuration registry data/tags/feature

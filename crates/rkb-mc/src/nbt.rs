@@ -734,6 +734,29 @@ impl Nbt {
         Ok(root)
     }
 
+    /// Reads an uncompressed **anonymous** tag with default limits.
+    ///
+    /// Network NBT (`1.20.2+` packet components, registry entries, and
+    /// disconnect reasons) omits the root name that files carry. The payload is
+    /// otherwise identical, so this shares the same strict reader.
+    pub fn read_anonymous(bytes: &[u8]) -> Result<Tag, NbtError> {
+        Self::read_anonymous_with_limits(bytes, Limits::default())
+    }
+
+    /// Reads an uncompressed anonymous tag with explicit limits.
+    pub fn read_anonymous_with_limits(bytes: &[u8], limits: Limits) -> Result<Tag, NbtError> {
+        let mut reader = Reader::new(bytes, limits);
+        let tag = reader.u8()?;
+        if tag == TAG_END {
+            return Err(NbtError::RootIsEnd);
+        }
+        let root = reader.read_payload(tag, 0)?;
+        if reader.pos != bytes.len() {
+            return Err(NbtError::TrailingData { offset: reader.pos });
+        }
+        Ok(root)
+    }
+
     /// Reads a gzip-compressed named tag with default limits.
     pub fn read_gzip(bytes: &[u8]) -> Result<Tag, NbtError> {
         Self::read_gzip_with_limits(bytes, Limits::default())
@@ -851,6 +874,24 @@ mod tests {
         let tag = sample();
         let bytes = Nbt::write(&tag).expect("write");
         assert_eq!(Nbt::read(&bytes).expect("read"), tag);
+    }
+
+    #[test]
+    fn anonymous_network_nbt_has_no_root_name() {
+        let tag = sample();
+        let named = Nbt::write(&tag).expect("write");
+        // tag id, two-byte empty name, payload
+        assert_eq!(&named[1..3], &[0, 0]);
+        let mut anonymous = Vec::with_capacity(named.len() - 2);
+        anonymous.push(named[0]);
+        anonymous.extend_from_slice(&named[3..]);
+        assert_eq!(Nbt::read_anonymous(&anonymous).expect("read"), tag);
+
+        // A named tag is not a valid anonymous tag because its name bytes are
+        // read as payload.
+        assert!(Nbt::read_anonymous(&named).is_err());
+        assert!(Nbt::read_anonymous(&[]).is_err());
+        assert!(Nbt::read_anonymous(&[TAG_END]).is_err());
     }
 
     #[test]

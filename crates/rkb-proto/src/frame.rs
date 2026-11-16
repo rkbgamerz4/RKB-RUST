@@ -165,7 +165,12 @@ impl FrameCodec {
         Ok(())
     }
 
-    fn decode_contents(&self, contents: &[u8]) -> Result<Vec<u8>> {
+    /// Decodes the bytes **after** a frame's length prefix.
+    ///
+    /// A connection that decrypts before framing uses this directly: the
+    /// encrypted stream carries the length prefix and contents as one unit, so
+    /// decryption happens on the whole frame before the length is parsed.
+    pub fn decode_contents(&self, contents: &[u8]) -> Result<Vec<u8>> {
         if contents.len() > self.max_frame {
             return Err(Error::PacketTooLarge {
                 size: contents.len(),

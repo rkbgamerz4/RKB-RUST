@@ -151,6 +151,9 @@ pub struct LoginSuccess {
     pub uuid: u128,
     pub name: String,
     pub properties: Vec<Property>,
+    /// 1.21 added this flag; vanilla clients acknowledge it but the field is
+    /// part of the packet and must be consumed.
+    pub strict_error_handling: bool,
 }
 
 impl LoginSuccess {
@@ -167,6 +170,7 @@ impl LoginSuccess {
         for property in &self.properties {
             property.write(&mut writer)?;
         }
+        writer.write_bool(self.strict_error_handling);
         Ok(writer.into_inner())
     }
 
@@ -185,12 +189,142 @@ impl LoginSuccess {
         for _ in 0..count {
             properties.push(Property::read(&mut reader)?);
         }
+        let strict_error_handling = reader.read_bool()?;
         reader.finish()?;
         Ok(Self {
             uuid,
             name,
             properties,
+            strict_error_handling,
         })
+    }
+}
+
+/// Clientbound `LoginPluginRequest`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginPluginRequest {
+    pub message_id: i32,
+    pub channel: String,
+    /// The rest of the packet; the channel defines its meaning.
+    pub data: Vec<u8>,
+}
+
+impl LoginPluginRequest {
+    /// Encodes the packet id and body.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new();
+        writer.write_varint(ids::login::clientbound::PLUGIN_REQUEST);
+        writer.write_varint(self.message_id);
+        writer.write_string(&self.channel, 32_767)?;
+        writer.write_bytes(&self.data);
+        Ok(writer.into_inner())
+    }
+
+    /// Decodes a body (without the packet id).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(payload);
+        let message_id = reader.read_varint()?;
+        let channel = reader.read_string(32_767)?;
+        let data = reader.read_rest().to_vec();
+        Ok(Self {
+            message_id,
+            channel,
+            data,
+        })
+    }
+}
+
+/// Serverbound `LoginPluginResponse`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginPluginResponse {
+    pub message_id: i32,
+    /// `None` means "not understood"; some payload means the channel handled it.
+    pub data: Option<Vec<u8>>,
+}
+
+impl LoginPluginResponse {
+    /// Encodes the packet id and body.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new();
+        writer.write_varint(ids::login::serverbound::PLUGIN_RESPONSE);
+        writer.write_varint(self.message_id);
+        writer.write_bool(self.data.is_some());
+        if let Some(data) = &self.data {
+            writer.write_bytes(data);
+        }
+        Ok(writer.into_inner())
+    }
+
+    /// Decodes a body (without the packet id).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(payload);
+        let message_id = reader.read_varint()?;
+        let data = if reader.read_bool()? {
+            Some(reader.read_rest().to_vec())
+        } else {
+            None
+        };
+        reader.finish()?;
+        Ok(Self { message_id, data })
+    }
+}
+
+/// Clientbound login-state `CookieRequest`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginCookieRequest {
+    pub key: String,
+}
+
+impl LoginCookieRequest {
+    /// Encodes the packet id and body.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new();
+        writer.write_varint(ids::login::clientbound::COOKIE_REQUEST);
+        writer.write_string(&self.key, 32_767)?;
+        Ok(writer.into_inner())
+    }
+
+    /// Decodes a body (without the packet id).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(payload);
+        let key = reader.read_string(32_767)?;
+        reader.finish()?;
+        Ok(Self { key })
+    }
+}
+
+/// Serverbound login-state `CookieResponse`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginCookieResponse {
+    pub key: String,
+    /// `None` means the cookie is absent.
+    pub payload: Option<Vec<u8>>,
+}
+
+impl LoginCookieResponse {
+    /// Encodes the packet id and body.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new();
+        writer.write_varint(ids::login::serverbound::COOKIE_RESPONSE);
+        writer.write_string(&self.key, 32_767)?;
+        writer.write_bool(self.payload.is_some());
+        if let Some(payload) = &self.payload {
+            writer.write_byte_array(payload, 5120)?;
+        }
+        Ok(writer.into_inner())
+    }
+
+    /// Decodes a body (without the packet id).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(payload);
+        let key = reader.read_string(32_767)?;
+        let payload = if reader.read_bool()? {
+            Some(reader.read_byte_array(5120)?.to_vec())
+        } else {
+            None
+        };
+        reader.finish()?;
+        Ok(Self { key, payload })
     }
 }
 
@@ -315,6 +449,7 @@ mod tests {
                 value: "e30=".to_owned(),
                 signature: Some("sig".to_owned()),
             }],
+            strict_error_handling: true,
         };
         let encoded = value.encode().unwrap();
         assert_eq!(
@@ -358,6 +493,66 @@ mod tests {
                 .unwrap(),
             value
         );
+    }
+
+    #[test]
+    fn plugin_exchange_round_trips() {
+        let request = LoginPluginRequest {
+            message_id: 7,
+            channel: "minecraft:brand".to_owned(),
+            data: b"payload".to_vec(),
+        };
+        let encoded = request.encode().unwrap();
+        assert_eq!(
+            LoginPluginRequest::decode(payload(&encoded, ids::login::clientbound::PLUGIN_REQUEST))
+                .unwrap(),
+            request
+        );
+
+        for data in [None, Some(b"ok".to_vec())] {
+            let response = LoginPluginResponse {
+                message_id: 7,
+                data,
+            };
+            let encoded = response.encode().unwrap();
+            assert_eq!(
+                LoginPluginResponse::decode(payload(
+                    &encoded,
+                    ids::login::serverbound::PLUGIN_RESPONSE
+                ))
+                .unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_exchange_round_trips() {
+        let request = LoginCookieRequest {
+            key: "rkb:session".to_owned(),
+        };
+        let encoded = request.encode().unwrap();
+        assert_eq!(
+            LoginCookieRequest::decode(payload(&encoded, ids::login::clientbound::COOKIE_REQUEST))
+                .unwrap(),
+            request
+        );
+
+        for value in [None, Some(vec![1, 2, 3])] {
+            let response = LoginCookieResponse {
+                key: "rkb:session".to_owned(),
+                payload: value,
+            };
+            let encoded = response.encode().unwrap();
+            assert_eq!(
+                LoginCookieResponse::decode(payload(
+                    &encoded,
+                    ids::login::serverbound::COOKIE_RESPONSE
+                ))
+                .unwrap(),
+                response
+            );
+        }
     }
 
     #[test]
