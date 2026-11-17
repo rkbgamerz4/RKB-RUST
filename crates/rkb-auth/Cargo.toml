@@ -1,0 +1,23 @@
+[package]
+name = "rkb-auth"
+description = "Microsoft, Xbox Live, and Minecraft Services authentication for RKB RUST"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rkb-auth"
+path = "src/bin/rkb-auth.rs"
+
+[dependencies]
+rkb-net = { workspace = true }
+rkb-proto = { workspace = true }
+serde_json = "1.0"
+ureq = { version = "=3.2.1", default-features = false, features = ["rustls"] }
+zeroize = "1.8"
+
+[lints]
+workspace = true

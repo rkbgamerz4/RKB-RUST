@@ -28,6 +28,7 @@ use rkb_proto::packets::{
 };
 
 const PUBLIC_DER: &[u8] = include_bytes!("fixtures/rsa_test_pub.der");
+const AUTHENTICATED_UUID: u128 = 0xb50a_d385_829d_3141_a216_7e7d_7539_ba7f;
 const MODULUS: &str = "df37d97634ac5fba3034ec94adf442f898a686c8d9a55505cbd73e4ff55fb2ad3e8e6d30becfb52b6b995f6c3c7be25dd28841d25cb8d39ef0ca0c63b597d2ffbc817972bd7867bfcabfaf95fd847341c6ede5b74f28cc27e945cce5232b9b3723cd6953739a2473a21d8c47d02a8884b8729f2e3189ba29f8c06e9a801061f5";
 const PRIVATE_EXPONENT: &str = "30f6e754eea90136ae6c6d990faf8d214b1afc66029829d663a88b9aae9097793947b4dc047f3b9692bbca1acc09c0d623e08fcfbd572dd4a7ad2a9a94b3012d7eef6ba9f9124743f15453034f5fdbdc4e925a056ea81a159ae45327d297783401dd339d39ef167d781b59a5623609b8d9b67a47285d7f5ec8dfa9f4f0ebf801";
 
@@ -277,6 +278,7 @@ fn offline_login_reaches_finish_configuration() {
     assert_eq!(outcome.protocol, PROTOCOL_VERSION);
     assert_eq!(outcome.data_version, DATA_VERSION);
     assert!(!outcome.encrypted);
+    assert!(!outcome.session_authenticated);
     assert_eq!(outcome.compression, Some(64));
     assert!(outcome.strict_error_handling);
     assert_eq!(outcome.registries, vec!["minecraft:dimension_type"]);
@@ -356,6 +358,7 @@ fn encrypted_login_without_authentication_completes() {
     .expect("encrypted offline-mode login should complete");
 
     assert!(outcome.encrypted);
+    assert!(!outcome.session_authenticated);
     assert_eq!(outcome.compression, Some(256));
     assert_eq!(outcome.name, "Alex");
     server.join().unwrap().expect("mock server");
@@ -412,6 +415,12 @@ fn authenticated_login_uses_the_vanilla_server_hash() {
 
     let (port, server) = run(listener, move |connection| {
         let start = expect_login_start(connection)?;
+        if start.uuid != AUTHENTICATED_UUID {
+            return Err(
+                "LoginStart sent an offline UUID instead of the authenticated profile UUID"
+                    .to_owned(),
+            );
+        }
         let request = EncryptionRequest {
             server_id: String::new(),
             public_key: PUBLIC_DER.to_vec(),
@@ -449,10 +458,7 @@ fn authenticated_login_uses_the_vanilla_server_hash() {
         connection.enable_encryption(&key);
         send(connection, &SetCompression { threshold: 16 }.encode())?;
         connection.set_compression(Some(16));
-        send(
-            connection,
-            &login_success(md5::offline_uuid(&start.name), &start.name),
-        )?;
+        send(connection, &login_success(AUTHENTICATED_UUID, &start.name))?;
         let (id, body) = next(connection)?;
         if id != ids::login::serverbound::LOGIN_ACKNOWLEDGED {
             return Err(format!("expected LoginAcknowledged, got 0x{id:02X}"));
@@ -467,12 +473,14 @@ fn authenticated_login_uses_the_vanilla_server_hash() {
     let outcome = login(
         &format!("127.0.0.1:{port}"),
         Duration::from_secs(10),
-        &LoginOptions::new("Notch"),
+        &LoginOptions::new("Notch").with_uuid(AUTHENTICATED_UUID),
         Some(&mut authenticator),
     )
     .expect("authenticated login should complete");
 
     assert!(outcome.encrypted);
+    assert!(outcome.session_authenticated);
+    assert_eq!(outcome.uuid, AUTHENTICATED_UUID);
     assert_eq!(outcome.compression, Some(16));
     assert!(recorded.lock().unwrap().is_some());
     server.join().unwrap().expect("mock server");

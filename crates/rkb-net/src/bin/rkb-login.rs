@@ -2,9 +2,10 @@
 //!
 //! Usage: `rkb-login <host[:port]> [username]`
 //!
-//! This is an M1 diagnostic. It supports offline-mode servers and, if a server
-//! requests online-mode authentication, it fails explicitly because M1 has no
-//! Microsoft authentication. It never asks for or stores credentials.
+//! This is an M1/M2 diagnostic. It supports offline-mode servers and fails
+//! explicitly when a server requests online-mode authentication, because this
+//! binary has no Microsoft authenticator; use `rkb-auth` for that. It never
+//! asks for or stores credentials.
 
 use std::env;
 use std::process::ExitCode;
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
             );
             println!("player: {} ({})", outcome.name, format_uuid(outcome.uuid));
             println!("encrypted: {}", outcome.encrypted);
+            println!("session authenticated: {}", outcome.session_authenticated);
             match outcome.compression {
                 Some(threshold) => println!("compression: threshold {threshold}"),
                 None => println!("compression: disabled"),

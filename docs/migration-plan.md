@@ -167,6 +167,12 @@ Status: **complete for offline mode** (2026-11-16). Evidence and limits are in
 
 ### M2 — Microsoft authentication
 
+Status: **implemented, unverified for real accounts** (2026-11-17). The
+protocol/HTTP path, token handling, and local evidence are in
+[`m2-verification.md`](m2-verification.md). The gate below stays open: no real
+account or Azure application id was available, so no real device-code sign-in
+or successful online-mode join is claimed.
+
 - Device-code flow, XBL user auth, XSTS, Minecraft token, profile, join server.
 - Own Azure application id; no Horizon id, no client secret in the binary.
 - Token store with refresh; never log tokens.

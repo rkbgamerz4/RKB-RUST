@@ -15,6 +15,7 @@ members = [
     "crates/rkb-minecraft",
     "crates/rkb-proto",
     "crates/rkb-net",
+    "crates/rkb-auth",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ rkb-mc = { path = "crates/rkb-mc" }
 rkb-minecraft = { path = "crates/rkb-minecraft" }
 rkb-proto = { path = "crates/rkb-proto" }
 rkb-net = { path = "crates/rkb-net" }
+rkb-auth = { path = "crates/rkb-auth" }
 jni = { version = "0.21.1", default-features = false }
 
 [workspace.lints.rust]

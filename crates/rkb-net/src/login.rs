@@ -56,18 +56,31 @@ pub trait SessionAuthenticator {
 pub struct LoginOptions {
     /// The player name sent in `LoginStart`.
     pub username: String,
+    /// The profile UUID sent in `LoginStart`.
+    ///
+    /// `None` derives the offline-mode UUID from the name. An authenticated
+    /// sign-in supplies the Mojang profile UUID instead.
+    pub uuid: Option<u128>,
     /// Whether to record packet ids and sizes.
     pub trace: bool,
 }
 
 impl LoginOptions {
-    /// Options with tracing enabled.
+    /// Options with tracing enabled and the offline UUID derived from the name.
     #[must_use]
     pub fn new(username: impl Into<String>) -> Self {
         Self {
             username: username.into(),
+            uuid: None,
             trace: true,
         }
+    }
+
+    /// Uses an explicit profile UUID, as an online-mode sign-in requires.
+    #[must_use]
+    pub fn with_uuid(mut self, uuid: u128) -> Self {
+        self.uuid = Some(uuid);
+        self
     }
 }
 
@@ -109,6 +122,9 @@ pub struct LoginOutcome {
     pub strict_error_handling: bool,
     /// Whether the key exchange ran.
     pub encrypted: bool,
+    /// Whether the server required and the client completed session-server
+    /// authentication (`join_server`) for this login.
+    pub session_authenticated: bool,
     /// The negotiated compression threshold.
     pub compression: Option<usize>,
     /// Registry names received before `FinishConfiguration`.
@@ -154,7 +170,7 @@ pub fn login(
         trace_enabled: options.trace,
         authenticator,
     };
-    session.run(&address, &options.username)
+    session.run(&address, options)
 }
 
 fn validate_username(username: &str) -> Result<()> {
@@ -191,7 +207,7 @@ fn connect(address: &ServerAddress, timeout: Duration) -> Result<TcpStream> {
 }
 
 impl<S: Read + Write> Session<'_, S> {
-    fn run(&mut self, address: &ServerAddress, username: &str) -> Result<LoginOutcome> {
+    fn run(&mut self, address: &ServerAddress, options: &LoginOptions) -> Result<LoginOutcome> {
         let handshake = Handshake {
             protocol: PROTOCOL_VERSION,
             host: address.host.clone(),
@@ -200,17 +216,19 @@ impl<S: Read + Write> Session<'_, S> {
         };
         self.send("handshake", &handshake.encode()?)?;
 
-        let offline_uuid = md5::offline_uuid(username);
+        let username = options.username.as_str();
+        let uuid = options.uuid.unwrap_or_else(|| md5::offline_uuid(username));
         self.send(
             "login",
             &LoginStart {
                 name: username.to_owned(),
-                uuid: offline_uuid,
+                uuid,
             }
             .encode()?,
         )?;
 
         let mut encrypted = false;
+        let mut session_authenticated = false;
         let mut compression = None;
         loop {
             let body = self.recv("login")?;
@@ -236,11 +254,14 @@ impl<S: Read + Write> Session<'_, S> {
 
                     if request.should_authenticate {
                         match self.authenticator.as_deref_mut() {
-                            Some(authenticator) => authenticator.join_server(&hash)?,
+                            Some(authenticator) => {
+                                authenticator.join_server(&hash)?;
+                                session_authenticated = true;
+                            }
                             None => {
                                 return Err(Error::protocol(
                                     "server requires online-mode authentication and no \
-                                     authenticator is configured; M1 supports offline mode only",
+                                     authenticator is configured",
                                 ))
                             }
                         }
@@ -273,6 +294,7 @@ impl<S: Read + Write> Session<'_, S> {
                         properties: success.properties,
                         strict_error_handling: success.strict_error_handling,
                         encrypted,
+                        session_authenticated,
                         compression,
                         registries: summary.registries,
                         feature_flags: summary.feature_flags,

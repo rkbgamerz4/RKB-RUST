@@ -17,28 +17,31 @@ persists seed, player pose, and edits.
 > Microsoft authentication, vanilla-server multiplayer, client worlds, entities,
 > inventory, and a GPU renderer. See [`docs/audit-current.md`](docs/audit-current.md),
 > [`docs/horizon-comparison.md`](docs/horizon-comparison.md),
-> [`docs/migration-plan.md`](docs/migration-plan.md), and
-> [`docs/m1-verification.md`](docs/m1-verification.md). New protocol work lives
+> [`docs/migration-plan.md`](docs/migration-plan.md),
+> [`docs/m1-verification.md`](docs/m1-verification.md), and
+> [`docs/m2-verification.md`](docs/m2-verification.md). New protocol work lives
 > on `feature/mc-java-protocol`.
 
 This is not a complete Minecraft client. It speaks the 1.21.1 status, login,
-and configuration protocol, but does not yet authenticate with Microsoft, enter
-the play state, or join a world. There are no Mojang textures or resource packs,
-dynamic lightmaps or shadows, inventory, mobs, or survival. The project contains
-no Minecraft assets, jars, or game files; block textures are generated
+and configuration protocol and implements Microsoft/Xbox/Minecraft Services
+sign-in, but does not yet enter the play state or join a world. Real account
+sign-in and an online-mode join remain unverified until a user supplies an
+account and Azure application id. There are no Mojang textures or resource
+packs, dynamic lightmaps or shadows, inventory, mobs, or survival. The project
+contains no Minecraft assets, jars, or game files; block textures are generated
 procedurally by RKB code.
 
 ## Status
 
 | Area | State |
 | --- | --- |
-| Rust workspace | Building on stable Rust; 309 unit/integration tests |
+| Rust workspace | Building on stable Rust; 349 unit/integration tests |
 | Renderer | Software RGBA8 rasterizer with primitives, alpha blending, a 2D camera, texture sampling, and a reciprocal-depth perspective 3D path with per-vertex UV/light |
 | Runtime | Fixed timestep, accumulation and drop accounting, lifecycle FSM, resize handling |
 | Input | Multi-touch state, tap/drag/pinch detectors, virtual joystick, touch button |
 | Resources | Traversal-safe paths, memory/file sources, checksummed `RKBPAK1` archives, LRU cache |
 | Minecraft data | 1.21/1.21.1 saved-world reader and atomic writer: NBT, Anvil regions, chunk palettes and construction, block states, registry reports, `rkb-world` CLI |
-| Minecraft protocol | `rkb-proto` + `rkb-net`: 1.21.1 (protocol 767) codecs, framing, zlib, AES/CFB8, RSA/PKCS#1 v1.5, Java server hash, handshake/status/login/configuration packets, and an offline-mode login through `FinishConfiguration`, verified against the official 1.21.1 server. Microsoft authentication (M2) and the play state are not implemented |
+| Minecraft protocol | `rkb-proto` + `rkb-net`: 1.21.1 (protocol 767) codecs, framing, zlib, AES/CFB8, RSA/PKCS#1 v1.5, Java server hash, handshake/status/login/configuration packets, and offline- and online-mode login through `FinishConfiguration`, verified against the official 1.21.1 server in offline mode. `rkb-auth` implements Microsoft/Xbox/Minecraft Services sign-in, profile and entitlement checks, refresh tokens, and session-server join; real account sign-in is unverified. The play state is not implemented |
 | Minecraft client | `rkb-minecraft`: default seeded terrain, save loading, background chunk streaming and face meshing, textured block rendering from a procedural atlas with face shading and ambient occlusion, first-person camera, walking/jumping/flight, AABB collision, raycast break/place, session persistence and autosave. This is the prototype being migrated |
 | Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host that launches the Minecraft client, 0.6x render scaling, status/help overlay, lifecycle and touch wiring |
 | CI | Format, clippy, tests, release build, generated and saved world renders, NDK ARM64 build, APK and ABI verification, emulator fresh-install and supplied-save assertions |
@@ -143,7 +146,7 @@ RKB_RENDER_OUT=/tmp/rkb-generated.ppm \
   cargo test -p rkb-minecraft --test generated_render -- --nocapture
 ```
 
-## Minecraft 1.21.1 network (M1)
+## Minecraft 1.21.1 network (M1) and Microsoft authentication (M2)
 
 `rkb-proto` and `rkb-net` implement the protocol-767 path from handshake to the
 end of configuration:
@@ -173,9 +176,46 @@ cargo test -p rkb-proto
 cargo test -p rkb-net
 ```
 
-Online-mode servers require Microsoft authentication. M1 fails explicitly when
-a server requests it; it does not fake a session or store credentials. That
-flow is the M2 gate.
+### Microsoft sign-in
+
+`rkb-auth` implements the full desktop sign-in chain without collecting a
+password: OAuth 2.0 device code, Xbox Live user authentication, XSTS, Minecraft
+Services login, profile, entitlement check, and the session-server join that an
+online-mode server requires.
+
+- RKB ships no Azure client id and no client secret. Use your own registered
+  public client application; device-code flow must be enabled for it.
+- Only the user code and verification URL are printed. Access tokens, refresh
+  tokens, device codes, and Xbox tokens have redacted `Debug` output, live in
+  zeroizing buffers, and are never put in URLs or error messages.
+- Refresh-token storage is opt-in. `--token-file` writes one JSON file with mode
+  `0600`, refuses group/other access and symbolic links, and replaces the file
+  atomically. In-memory storage is the default.
+- Profile and entitlement verification run on every sign-in, including refresh,
+  so a session is never assumed from a stale token.
+
+```bash
+# device-code sign-in only; prints name, UUID, and entitlements
+RKB_MS_CLIENT_ID=<your-azure-app-id> \
+  cargo run -p rkb-auth --bin rkb-auth
+
+# optionally keep a refresh token and attempt an online-mode login
+RKB_MS_CLIENT_ID=<your-azure-app-id> \
+  cargo run -p rkb-auth --bin rkb-auth -- \
+    --token-file ~/.config/rkb/auth.json --server example.org:25565
+```
+
+The online-mode login path is implemented and tested against a loopback HTTP
+server and a mock protocol-767 server, but **a real Microsoft account sign-in
+and a real online-mode join remain unverified** because they require a
+user-supplied account and Azure application id. See
+[`docs/m2-verification.md`](docs/m2-verification.md). The client still stops at
+the end of configuration; it does not claim to enter the play state or load a
+world.
+
+`rkb-net` alone (without an authenticator) still fails explicitly when a server
+requests online-mode authentication; it does not fake a session or store
+credentials.
 
 ## Minecraft 1.21 world inspection
 
