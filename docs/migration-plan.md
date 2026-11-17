@@ -201,13 +201,31 @@ renderer's world store, then move networking into the Android ARM64 host. Those
 deliverables draw on M6 (renderer) and M7 (Android product path); M4 and M5
 below still describe the full gameplay gates.
 
-### M4 — Players, entities, and movement
+Status (2026-11-17): both steps are implemented. M4 rendered real server chunks
+in the existing client ([`m4-verification.md`](m4-verification.md)), and the
+Android host now starts a server join on a background thread and swaps the
+world in on the render thread (`nativeJoinServer`). The Android slice is
+recorded in [`m5-verification.md`](m5-verification.md); it is a product-path
+step, not the M5 gameplay gate below, and an on-device join is not yet
+observed.
+
+### M4 — Players, entities, movement, and server rendering
+
+Status: **server chunks and live block updates render through the existing
+client; movement is not yet sent** (2026-11-17). Evidence is in
+[`m4-verification.md`](m4-verification.md). Entity spawn/remove, relative and
+absolute moves, rotation, teleport confirmation, and keep-alives were
+implemented with the M3 play session. The remaining gate is local movement.
 
 - Spawn/remove, relative/absolute moves, metadata, rotation, teleport
-  confirmation, keep-alives.
-- Local player physics and collision against server chunks.
+  confirmation, keep-alives. **Implemented** (metadata and player-list packets
+  remain unhandled).
+- Local player physics and collision against server chunks. Local physics runs
+  against server blocks, but no movement packets are sent yet.
+- Server chunk conversion into `rkb_mc::Chunk` and the existing mesher, with no
+  procedural fallback. **Implemented and verified** with `rkb-join`.
 - Gate: two clients (RKB + vanilla) see each other move; positions agree within
-  tolerance; no desync over a timed run.
+  tolerance; no desync over a timed run. **Open.**
 
 ### M5 — Inventory, containers, and basic gameplay
 

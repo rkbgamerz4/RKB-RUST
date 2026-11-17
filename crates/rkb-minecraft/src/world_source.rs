@@ -1,12 +1,15 @@
-//! The two block sources the client can play: a user save or generated terrain.
+//! The block sources the client can play: a user save, generated terrain, or a
+//! live server world.
 //!
-//! Both return real [`Chunk`] values. Block edits are kept in one overlay owned
-//! by the client, so breaking and placing works identically on a read-only
-//! saved region world and on the generated world.
+//! All return real [`Chunk`] values, so the mesher does not know which source
+//! produced them. Local block edits are kept in one overlay owned by the
+//! client; server worlds are read-only until movement and block actions are
+//! sent to the server.
 
 use std::sync::Arc;
 
 use rkb_mc::{BlockState, Chunk, World};
+use rkb_net::{ServerPosition, ServerWorld};
 
 use crate::worldgen::GeneratedWorld;
 
@@ -29,6 +32,7 @@ impl ChunkSource for World {
 pub enum WorldKind {
     Save,
     Generated,
+    Server,
 }
 
 /// An opened world, either a 1.21 save or seeded generated terrain.
@@ -36,6 +40,7 @@ pub enum WorldKind {
 pub enum WorldState {
     Save(World, usize),
     Generated(GeneratedWorld),
+    Server(ServerWorld),
 }
 
 impl WorldState {
@@ -44,6 +49,7 @@ impl WorldState {
         match self {
             Self::Save(..) => WorldKind::Save,
             Self::Generated(_) => WorldKind::Generated,
+            Self::Server(_) => WorldKind::Server,
         }
     }
 
@@ -52,6 +58,7 @@ impl WorldState {
         match self.kind() {
             WorldKind::Save => "save",
             WorldKind::Generated => "generated",
+            WorldKind::Server => "server",
         }
     }
 
@@ -62,6 +69,7 @@ impl WorldState {
         match self {
             Self::Save(_, known) => *known,
             Self::Generated(world) => world.generated_chunks(),
+            Self::Server(world) => world.loaded_chunks(),
         }
     }
 
@@ -70,6 +78,7 @@ impl WorldState {
         match self {
             Self::Save(..) => None,
             Self::Generated(world) => Some(world.seed()),
+            Self::Server(_) => None,
         }
     }
 
@@ -78,6 +87,9 @@ impl WorldState {
         match self {
             Self::Save(..) => None,
             Self::Generated(world) => Some(world.spawn()),
+            Self::Server(world) => world.position().map(|position| {
+                rkb_core::Vec3::new(position.x as f32, position.y as f32, position.z as f32)
+            }),
         }
     }
 
@@ -85,6 +97,7 @@ impl WorldState {
         match self {
             Self::Save(..) => Vec::new(),
             Self::Generated(world) => world.poll(),
+            Self::Server(world) => world.poll(),
         }
     }
 
@@ -92,6 +105,9 @@ impl WorldState {
         match self {
             Self::Save(..) => {}
             Self::Generated(world) => world.retain_chunks(center, radius),
+            // The server decides when a column unloads. Dropping local copies
+            // early would leave holes if the player turns around.
+            Self::Server(_) => {}
         }
     }
 
@@ -100,6 +116,7 @@ impl WorldState {
         match self {
             Self::Save(..) => Vec::new(),
             Self::Generated(world) => world.chunks().map(|chunk| (**chunk).clone()).collect(),
+            Self::Server(_) => Vec::new(),
         }
     }
 
@@ -108,6 +125,7 @@ impl WorldState {
         match self {
             Self::Save(world, _) => world.block_at(x, y, z).map_err(|error| error.to_string()),
             Self::Generated(world) => Ok(world.block_at(x, y, z)),
+            Self::Server(world) => Ok(world.block_at(x, y, z)),
         }
     }
 
@@ -133,6 +151,11 @@ impl WorldState {
                             return false;
                         }
                     }
+                    Self::Server(world) => {
+                        if world.chunk(cx + dx, cz + dz).is_none() {
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -145,6 +168,44 @@ impl ChunkSource for WorldState {
         match self {
             Self::Save(world, _) => World::chunk(world, cx, cz).map_err(|error| error.to_string()),
             Self::Generated(world) => Ok(world.chunk(cx, cz)),
+            Self::Server(world) => Ok(world.chunk(cx, cz)),
+        }
+    }
+}
+
+impl WorldState {
+    /// Takes a server position update once, so the camera can follow a join or
+    /// a server teleport without fighting local movement.
+    pub fn take_server_position(&mut self) -> Option<ServerPosition> {
+        match self {
+            Self::Server(world) => world.take_position(),
+            _ => None,
+        }
+    }
+
+    /// Takes a status message from the play session.
+    pub fn take_server_message(&mut self) -> Option<String> {
+        match self {
+            Self::Server(world) => world.take_message(),
+            _ => None,
+        }
+    }
+
+    /// Why a server session ended, if it did.
+    #[must_use]
+    pub fn server_disconnect(&self) -> Option<&str> {
+        match self {
+            Self::Server(world) => world.disconnect_reason(),
+            _ => None,
+        }
+    }
+
+    /// A protocol or chunk conversion failure reported by the play session.
+    #[must_use]
+    pub fn server_error(&self) -> Option<&str> {
+        match self {
+            Self::Server(world) => world.error(),
+            _ => None,
         }
     }
 }

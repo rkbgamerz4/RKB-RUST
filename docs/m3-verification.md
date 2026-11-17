@@ -299,6 +299,16 @@ M3-specific tests:
 - `rkb-net/tests/session.rs`: 10 login/configuration tests still pass, including
   authenticated UUID and offline/online-mode behavior.
 
+## CI
+
+Runs dispatched for commit `e59a1e9` on `feature/mc-java-protocol`:
+
+| Workflow | Run | Result |
+| --- | --- | --- |
+| Rust CI | `44011791285` | success |
+| Android ARM64 | `44011796359` | success |
+| Android emulator startup | `44011801557` | success |
+
 ## Not verified
 
 - **Real Microsoft sign-in and a successful online-mode join.** The same gate as

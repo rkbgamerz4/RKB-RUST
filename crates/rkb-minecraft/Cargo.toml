@@ -12,16 +12,19 @@ authors.workspace = true
 name = "rkb-fixture"
 path = "src/bin/rkb-fixture.rs"
 
+[[bin]]
+name = "rkb-join"
+path = "src/bin/rkb-join.rs"
+
 [dependencies]
 rkb-core = { workspace = true }
 rkb-input = { workspace = true }
 rkb-mc = { workspace = true }
+rkb-net = { workspace = true }
+rkb-platform = { workspace = true }
 rkb-render = { workspace = true }
 rkb-runtime = { workspace = true }
 serde_json = "1.0"
-
-[dev-dependencies]
-rkb-platform = { workspace = true }
 
 [lints]
 workspace = true

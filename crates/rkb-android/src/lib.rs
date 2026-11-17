@@ -120,6 +120,58 @@ pub extern "system" fn Java_com_rkb_rust_RkbNative_nativeCreate(
     Box::into_raw(Box::new(engine)) as jlong
 }
 
+fn string_arg(env: &mut JNIEnv, value: jstring) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: JNI guarantees a valid local reference for the duration of this
+    // call; the string is converted immediately and never retained.
+    let text = unsafe { JString::from_raw(value) };
+    env.get_string(&text).ok().map(Into::into)
+}
+
+/// Starts an offline-mode server join without blocking the render thread.
+///
+/// `registry_path` must point at a `blocks.json` report the user generated from
+/// their own 1.21.1 installation; RKB bundles no Mojang data.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "system" fn Java_com_rkb_rust_RkbNative_nativeJoinServer(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    server: jstring,
+    name: jstring,
+    registry_path: jstring,
+) -> jboolean {
+    let Some(engine) = (unsafe { engine_mut(handle) }) else {
+        log(LOG_ERROR, "nativeJoinServer: invalid engine handle");
+        return JNI_FALSE;
+    };
+    let Some(server) = string_arg(&mut env, server) else {
+        log(LOG_ERROR, "nativeJoinServer: server address is missing");
+        return JNI_FALSE;
+    };
+    let Some(name) = string_arg(&mut env, name) else {
+        log(LOG_ERROR, "nativeJoinServer: player name is missing");
+        return JNI_FALSE;
+    };
+    let Some(registry) = string_arg(&mut env, registry_path) else {
+        log(LOG_ERROR, "nativeJoinServer: block report path is missing");
+        return JNI_FALSE;
+    };
+    match engine.begin_join(server, name, PathBuf::from(registry)) {
+        Ok(()) => {
+            log(LOG_INFO, "nativeJoinServer: connection started");
+            JNI_TRUE
+        }
+        Err(error) => {
+            log(LOG_ERROR, &format!("nativeJoinServer rejected: {error}"));
+            JNI_FALSE
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_rkb_rust_RkbNative_nativeDestroy(
     _env: JNIEnv,

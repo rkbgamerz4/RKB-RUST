@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rkb_core::{Rect, Stage, Vec2, Vec3};
 use rkb_input::{TouchButton, TouchEvent, TouchId, TouchPhase, VirtualJoystick};
 use rkb_mc::{BlockState, World};
+use rkb_net::ServerWorld;
 use rkb_render::{Color, DrawList, Vertex3D};
 use rkb_runtime::{Game, UpdateContext};
 
@@ -35,7 +36,7 @@ use crate::mesh::{build_chunk_mesh, is_solid_block, ChunkMesh, EditMap};
 use crate::player::{BlockQuery, MoveInput, Player};
 use crate::session::{self, PlayerSnapshot, Session};
 use crate::textures::BlockAtlas;
-use crate::world_source::{WorldKind, WorldState};
+use crate::world_source::{ChunkSource, WorldKind, WorldState};
 use crate::worldgen::{DEFAULT_SEED, WORLD_MIN_Y};
 
 /// Chunks are streamed in a square around the player.
@@ -178,6 +179,44 @@ impl MinecraftGame {
             }
         }
         game
+    }
+
+    /// Creates a client for a live server world.
+    ///
+    /// The world is the server's: chunks and block updates arrive over the
+    /// network, and no generated terrain is substituted for missing columns.
+    #[must_use]
+    pub fn join_server(server: ServerWorld) -> Self {
+        let mut game = Self::new(None);
+        game.load_server(server);
+        game
+    }
+
+    /// Replaces the current world with a live server world.
+    ///
+    /// This is the in-place form used by the Android bridge, which keeps one
+    /// runtime and swaps its game state after a background login completes.
+    pub fn load_server(&mut self, server: ServerWorld) {
+        self.world_path = None;
+        self.edits.clear();
+        self.meshes.clear();
+        self.queue.clear();
+        self.center = None;
+        self.save_dirty = false;
+        self.save_status = "multiplayer world; local saves are disabled".to_owned();
+        self.last_error = None;
+        if let Some(position) = server.position() {
+            let spawn = Vec3::new(position.x as f32, position.y as f32, position.z as f32);
+            self.spawn = spawn;
+            self.player = Player::new(spawn);
+            // Minecraft yaw 0 faces +Z; the camera at yaw 0 faces -Z. Pitch is
+            // positive downwards in the protocol and positive upwards here.
+            self.player.yaw = position.yaw.to_radians() + std::f32::consts::PI;
+            self.player.pitch = -position.pitch.to_radians();
+        }
+        self.message =
+            "Joined a protocol-767 server world; only server chunks are rendered.".to_owned();
+        self.world = Some(WorldState::Server(server));
     }
 
     fn open_or_generate(&mut self, path: PathBuf) {
@@ -388,6 +427,15 @@ impl MinecraftGame {
         position: (i32, i32, i32),
         state: BlockState,
     ) -> Result<bool, String> {
+        if matches!(
+            self.world.as_ref().map(WorldState::kind),
+            Some(WorldKind::Server)
+        ) {
+            return Err(
+                "block edits are not sent to a server yet; the server world is read-only"
+                    .to_owned(),
+            );
+        }
         let base = self
             .world
             .as_mut()
@@ -526,6 +574,14 @@ impl MinecraftGame {
 
     /// Writes the session and, for generated worlds, region files.
     pub fn save(&mut self) -> Result<(), String> {
+        if matches!(
+            self.world.as_ref().map(WorldState::kind),
+            Some(WorldKind::Server)
+        ) {
+            self.save_status = "multiplayer world; not written locally".to_owned();
+            self.save_dirty = false;
+            return Ok(());
+        }
         let Some(path) = self.world_path.clone() else {
             return Err("no world directory configured".to_owned());
         };
@@ -673,11 +729,67 @@ impl MinecraftGame {
         }
     }
 
-    fn step(&mut self, dt: f32) {
+    /// Drains server updates, follows server teleports, and re-queues changed
+    /// chunk meshes. This never blocks on the socket.
+    fn poll_server(&mut self) {
         let Some(world) = self.world.as_mut() else {
             return;
         };
-        let _ = world.poll();
+        let updated = world.poll();
+
+        if let Some(position) = world.take_server_position() {
+            let spawn = Vec3::new(position.x as f32, position.y as f32, position.z as f32);
+            self.spawn = spawn;
+            self.player.position = spawn;
+            self.player.velocity = Vec3::ZERO;
+            self.player.yaw = position.yaw.to_radians() + std::f32::consts::PI;
+            self.player.pitch = -position.pitch.to_radians();
+            self.center = None;
+        }
+        if let Some(message) = world.take_server_message() {
+            self.message = message;
+        }
+        if let Some(error) = world.server_error() {
+            self.last_error = Some(error.to_owned());
+            self.message = format!("Server error: {error}");
+        }
+        if let Some(reason) = world.server_disconnect() {
+            self.message = format!("Disconnected: {reason}");
+        }
+
+        if matches!(world.kind(), WorldKind::Server) {
+            let unloaded: Vec<(i32, i32)> = self
+                .meshes
+                .keys()
+                .copied()
+                .filter(|&(cx, cz)| world.chunk(cx, cz).ok().flatten().is_none())
+                .collect();
+            for key in unloaded {
+                self.meshes.remove(&key);
+            }
+        }
+
+        let center = (
+            self.player.position.x.floor().div_euclid(16.0) as i32,
+            self.player.position.z.floor().div_euclid(16.0) as i32,
+        );
+        for key in updated {
+            if (key.0 - center.0).abs() > RETAIN_RADIUS || (key.1 - center.1).abs() > RETAIN_RADIUS
+            {
+                continue;
+            }
+            self.meshes.remove(&key);
+            if !self.queue.contains(&key) {
+                self.queue.push_front(key);
+            }
+        }
+    }
+
+    fn step(&mut self, dt: f32) {
+        self.poll_server();
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
 
         let value = self.joystick.value();
         let input = MoveInput {
@@ -700,7 +812,9 @@ impl MinecraftGame {
         self.player.position.x = self.player.position.x.clamp(-WORLD_BORDER, WORLD_BORDER);
         self.player.position.z = self.player.position.z.clamp(-WORLD_BORDER, WORLD_BORDER);
 
-        if self.player.position.y < (WORLD_MIN_Y + 4) as f32 {
+        if self.player.position.y < (WORLD_MIN_Y + 4) as f32
+            && !matches!(world.kind(), WorldKind::Server)
+        {
             let before = self.player.position;
             let flying = self.player.flying;
             self.player = Player::new(self.spawn);
@@ -769,7 +883,7 @@ impl MinecraftGame {
             // mesh it with boundary walls. Generated chunks wait for their
             // full neighbourhood so no false walls appear at seams.
             WorldKind::Save => true,
-            WorldKind::Generated => world.neighborhood_ready(cx, cz),
+            WorldKind::Generated | WorldKind::Server => world.neighborhood_ready(cx, cz),
         };
         if !ready {
             self.queue.push_back((cx, cz));

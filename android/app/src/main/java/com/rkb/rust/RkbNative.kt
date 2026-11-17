@@ -49,6 +49,12 @@ object RkbNative {
         y: Float,
         timeMs: Long,
     ): Boolean
+    external fun nativeJoinServer(
+        handle: Long,
+        server: String,
+        name: String,
+        registryPath: String,
+    ): Boolean
     external fun nativePause(handle: Long): Boolean
     external fun nativeResume(handle: Long): Boolean
     external fun nativeStats(handle: Long): String

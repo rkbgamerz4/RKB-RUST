@@ -10,12 +10,13 @@ use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use rkb_mc::{Nbt, Tag};
-use rkb_net::{login_configured, Event, LoginOptions, PlaySession};
+use rkb_mc::{BlockRegistry, Nbt, Tag};
+use rkb_net::{login_configured, Event, LoginOptions, PlaySession, ServerWorld};
 use rkb_proto::codec::{Reader, Writer};
 use rkb_proto::ids;
 use rkb_proto::packets::play::{
-    ChunkData, JoinGame, LightData, PalettedContainer, Slot, SpawnInfo, SyncPlayerPosition,
+    BlockChange, BlockPos, ChunkData, JoinGame, KickDisconnect, LightData, PalettedContainer, Slot,
+    SpawnInfo, SyncPlayerPosition,
 };
 use rkb_proto::packets::{
     ClientInformation, FeatureFlags, FinishConfiguration, LoginSuccess, RegistryData,
@@ -378,5 +379,147 @@ fn inventory_components_are_reported_not_guessed() {
     assert_eq!(session.player().inventory, Vec::<Slot>::new());
     assert_eq!(session.stats().unsupported_packets, 1);
 
+    server.join().unwrap().unwrap();
+}
+
+fn small_registry() -> BlockRegistry {
+    BlockRegistry::from_json(
+        r#"{
+            "minecraft:air": { "states": [{ "id": 0, "default": true }] },
+            "minecraft:stone": { "states": [{ "id": 1, "default": true }] },
+            "minecraft:glowstone": { "states": [{ "id": 2, "default": true }] }
+        }"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn server_world_feeds_chunks_positions_and_block_updates() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (port, server) = run(listener, |connection| {
+        let (id, _) = next(connection)?;
+        if id != ids::handshake::SERVERBOUND_INTENTION {
+            return Err(format!("expected handshake, got 0x{id:02X}"));
+        }
+        let (id, body) = next(connection)?;
+        if id != ids::login::serverbound::HELLO {
+            return Err(format!("expected LoginStart, got 0x{id:02X}"));
+        }
+        rkb_proto::packets::LoginStart::decode(&body).map_err(|error| error.to_string())?;
+        send(
+            connection,
+            &LoginSuccess {
+                uuid: 2,
+                name: "WorldTester".to_owned(),
+                properties: Vec::new(),
+                strict_error_handling: true,
+            }
+            .encode()
+            .map_err(|error| error.to_string())?,
+        )?;
+        let (id, _) = next(connection)?;
+        if id != ids::login::serverbound::LOGIN_ACKNOWLEDGED {
+            return Err(format!("expected LoginAcknowledged, got 0x{id:02X}"));
+        }
+        configuration(connection)?;
+        send(
+            connection,
+            &join_game().encode().map_err(|error| error.to_string())?,
+        )?;
+        send(
+            connection,
+            &chunk_packet().encode().map_err(|error| error.to_string())?,
+        )?;
+        send(
+            connection,
+            &SyncPlayerPosition {
+                x: 32.5,
+                y: 4.0,
+                z: -40.5,
+                yaw: 90.0,
+                pitch: -10.0,
+                flags: 0,
+                teleport_id: 21,
+            }
+            .encode()
+            .map_err(|error| error.to_string())?,
+        )?;
+        let (id, _) = next(connection)?;
+        if id != ids::play::serverbound::TELEPORT_CONFIRM {
+            return Err(format!("expected TeleportConfirm, got 0x{id:02X}"));
+        }
+        send(
+            connection,
+            &BlockChange {
+                position: BlockPos::new(32, 0, -48),
+                state_id: 2,
+            }
+            .encode()
+            .map_err(|error| error.to_string())?,
+        )?;
+        send(connection, &keep_alive(77))?;
+        let (id, body) = next(connection)?;
+        if id != ids::play::serverbound::KEEP_ALIVE {
+            return Err(format!("expected KeepAlive reply, got 0x{id:02X}"));
+        }
+        if Reader::new(&body).read_i64().map_err(|e| e.to_string())? != 77 {
+            return Err("keep-alive id did not round-trip".to_owned());
+        }
+        let reason = anonymous_compound(&[("text", Tag::String("world done".to_owned()))]);
+        send(
+            connection,
+            &KickDisconnect { reason_nbt: reason }
+                .encode()
+                .map_err(|error| error.to_string())?,
+        )?;
+        Ok(())
+    });
+
+    let configured = login_configured(
+        &format!("127.0.0.1:{port}"),
+        Duration::from_secs(10),
+        &LoginOptions::new("WorldTester"),
+        None,
+    )
+    .expect("login and configuration");
+    let mut world =
+        ServerWorld::from_configured(configured, small_registry()).expect("server world");
+
+    let position = world.position().expect("first position");
+    assert_eq!((position.x, position.y, position.z), (32.5, 4.0, -40.5));
+    assert_eq!((position.yaw, position.pitch), (90.0, -10.0));
+    assert!(world.take_position().is_some());
+    assert!(world.take_position().is_none());
+
+    let mut converted = false;
+    let mut updated = false;
+    for _ in 0..200 {
+        let dirty = world.poll();
+        converted |= dirty.contains(&(2, -3));
+        if world.block_at(32, 0, -48) == Some(rkb_mc::BlockState::new("minecraft:glowstone")) {
+            updated = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(converted, "chunk (2, -3) was never reported dirty");
+    assert!(updated, "block update was not applied");
+    assert_eq!(world.loaded_chunks(), 1);
+    assert!(world.chunks_received() >= 1);
+    assert!(world.block_updates() >= 1);
+    assert_eq!(
+        world.block_at(47, 15, -33),
+        Some(rkb_mc::BlockState::new("minecraft:stone"))
+    );
+    assert_eq!(world.block_at(0, 0, 0), None);
+
+    for _ in 0..200 {
+        world.poll();
+        if world.disconnect_reason().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(world.disconnect_reason(), Some("world done"));
     server.join().unwrap().unwrap();
 }

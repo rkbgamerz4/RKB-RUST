@@ -3,11 +3,15 @@
 //! Kept free of JNI types so it can be unit-tested on the host.
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 use rkb_core::{Stage, Vec2};
 use rkb_input::{TouchEvent, TouchPhase, TouchPoint};
+use rkb_mc::BlockRegistry;
 use rkb_minecraft::MinecraftGame;
+use rkb_net::ServerWorld;
 use rkb_platform::{Surface, SurfaceError};
 use rkb_runtime::{FrameReport, Runtime, RuntimeConfig};
 
@@ -70,6 +74,8 @@ pub struct AndroidEngine {
     width: u32,
     height: u32,
     destroyed: bool,
+    join: Option<Receiver<Result<ServerWorld, String>>>,
+    join_status: Option<String>,
 }
 
 impl AndroidEngine {
@@ -92,7 +98,79 @@ impl AndroidEngine {
             width,
             height,
             destroyed: false,
+            join: None,
+            join_status: None,
         }
+    }
+
+    /// Starts an offline-mode server join on a background thread.
+    ///
+    /// The render thread keeps running; [`Self::frame`] swaps in the world when
+    /// the connection is ready. Login and the initial chunk burst never block
+    /// the Android UI.
+    pub fn begin_join(
+        &mut self,
+        server: String,
+        username: String,
+        registry_path: PathBuf,
+    ) -> Result<(), String> {
+        if self.join.is_some() {
+            return Err("a server join is already in progress".to_owned());
+        }
+        if server.trim().is_empty() {
+            return Err("server address is empty".to_owned());
+        }
+        if username.trim().is_empty() {
+            return Err("player name is empty".to_owned());
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.join_status = Some(format!("connecting to {server}"));
+        self.join = Some(receiver);
+        thread::spawn(move || {
+            let result = BlockRegistry::from_file(&registry_path)
+                .map_err(|error| format!("block report {}: {error}", registry_path.display()))
+                .and_then(|registry| {
+                    ServerWorld::connect(&server, &username, Duration::from_secs(20), registry)
+                        .map_err(|error| format!("join failed: {error}"))
+                });
+            let _ = sender.send(result);
+        });
+        Ok(())
+    }
+
+    /// Promotes a completed background join and reports its status.
+    fn poll_join(&mut self) {
+        let Some(receiver) = self.join.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(server)) => {
+                self.join = None;
+                self.join_status = None;
+                self.runtime.game_mut().load_server(server);
+            }
+            Ok(Err(error)) => {
+                self.join = None;
+                self.join_status = Some(error);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.join = None;
+                self.join_status = Some("join thread stopped unexpectedly".to_owned());
+            }
+        }
+    }
+
+    /// True while a background server join is still connecting.
+    #[must_use]
+    pub fn join_in_progress(&self) -> bool {
+        self.join.is_some()
+    }
+
+    /// The latest join status, including failures.
+    #[must_use]
+    pub fn join_status(&self) -> Option<&str> {
+        self.join_status.as_deref()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -123,6 +201,7 @@ impl AndroidEngine {
         if self.destroyed {
             return EngineFrame::Failed("engine already destroyed".to_owned());
         }
+        self.poll_join();
         if width != self.width || height != self.height {
             self.resize(width, height);
         }
@@ -167,7 +246,7 @@ impl AndroidEngine {
         let stats = game.stats();
         let report = self.runtime.last_report();
         format!(
-            "stage={:?} frames={} fps={:.1} world={} kind={} chunks={}/{} visible={} faces={} tris={} blocks={} edits={} pos=({:.1},{:.1},{:.1}) yaw={:.0} pitch={:.0} fly={} save={} status={}",
+            "stage={:?} frames={} fps={:.1} world={} kind={} chunks={}/{} visible={} faces={} tris={} blocks={} edits={} pos=({:.1},{:.1},{:.1}) yaw={:.0} pitch={:.0} fly={} save={} join={} status={}",
             self.runtime.stage(),
             report.frame_index,
             report.fps,
@@ -187,6 +266,7 @@ impl AndroidEngine {
             stats.pitch.to_degrees(),
             stats.flying,
             game.save_status(),
+            self.join_status.as_deref().unwrap_or("idle"),
             game.status()
         )
     }
@@ -265,6 +345,35 @@ mod tests {
         assert_eq!(touch_phase(2), Some(TouchPhase::Moved));
         assert_eq!(touch_phase(3), Some(TouchPhase::Cancelled));
         assert_eq!(touch_phase(4), None);
+    }
+
+    #[test]
+    fn failed_server_join_is_reported_without_blocking() {
+        let mut engine = AndroidEngine::new(64, 36, None);
+        engine
+            .begin_join(
+                "127.0.0.1:1".to_owned(),
+                "Tester".to_owned(),
+                std::path::PathBuf::from("/nonexistent/blocks.json"),
+            )
+            .unwrap();
+        assert!(engine.join_in_progress());
+        let mut pixels = vec![0_u8; 64 * 36 * 4];
+        for _ in 0..200 {
+            engine.frame(&mut pixels, 64, 36, Duration::from_millis(16));
+            if !engine.join_in_progress() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!engine.join_in_progress());
+        let status = engine.join_status().expect("join failure status");
+        assert!(status.contains("blocks.json"), "{status}");
+        assert!(
+            engine.stats_text().contains("join=block report"),
+            "{}",
+            engine.stats_text()
+        );
     }
 
     #[test]

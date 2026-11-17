@@ -1,12 +1,14 @@
 package com.rkb.rust
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import android.text.InputType
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -16,8 +18,11 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -54,6 +59,16 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * User-supplied, version-pinned `blocks.json` report. RKB ships no Mojang
+     * data, so a server join fails with a readable message until this file is
+     * pushed next to the world directory.
+     */
+    private val defaultBlockReport: File by lazy {
+        val base = worldDir.parentFile ?: filesDir
+        File(base, "blocks.json")
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -79,6 +94,8 @@ class MainActivity : Activity() {
                 setBackgroundColor(Color.argb(150, 8, 12, 20))
                 setShadowLayer(2f, 0f, 1f, Color.BLACK)
                 text = overlayText("Starting Rust engine…")
+                isClickable = true
+                setOnClickListener { showJoinDialog() }
             }
             val root = FrameLayout(this)
             root.addView(
@@ -110,8 +127,64 @@ class MainActivity : Activity() {
         append(stats)
         append("\nLeft stick: move · Drag: look · JUMP / FLY")
         append("\nCrosshair: BREAK / PLACE · Autosave every 20s")
+        append("\nTap this panel to join a 1.21.1 server (offline mode, read-only)")
         append("\nWorld: ")
         append(worldDir.absolutePath)
+    }
+
+    /**
+     * Asks for a server address, player name, and the user's own `blocks.json`
+     * report. The request is queued for the render thread, which is the only
+     * thread allowed to call into the native engine.
+     */
+    private fun showJoinDialog() {
+        val density = resources.displayMetrics.density
+        val padding = (16 * density).toInt()
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(padding, padding, padding, 0)
+        }
+
+        val serverField = EditText(this).apply {
+            hint = "server, e.g. 192.168.1.10:25565"
+            setText("127.0.0.1:25565")
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
+        val nameField = EditText(this).apply {
+            hint = "player name"
+            setText("RKBPlayer")
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
+        val reportField = EditText(this).apply {
+            hint = "path to generated/reports/blocks.json"
+            setText(defaultBlockReport.absolutePath)
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
+        layout.addView(serverField)
+        layout.addView(nameField)
+        layout.addView(reportField)
+
+        AlertDialog.Builder(this)
+            .setTitle("Join a 1.21.1 server")
+            .setMessage(
+                "Offline mode only for now. The world is read-only: local " +
+                    "movement and block edits are not sent to the server yet.",
+            )
+            .setView(layout)
+            .setPositiveButton("Join") { _, _ ->
+                val server = serverField.text.toString().trim()
+                val name = nameField.text.toString().trim()
+                val report = reportField.text.toString().trim()
+                if (server.isEmpty() || name.isEmpty() || report.isEmpty()) {
+                    Toast.makeText(this, "server, name, and report are required", Toast.LENGTH_LONG)
+                        .show()
+                    return@setPositiveButton
+                }
+                view?.requestJoin(server, name, report)
+                Toast.makeText(this, "Connecting to $server…", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun showStartupError(detail: String) {
@@ -223,6 +296,7 @@ class MainActivity : Activity() {
 
         private var frameCount = 0L
         private val touchQueue = ConcurrentLinkedQueue<TouchSample>()
+        private val joinQueue = ConcurrentLinkedQueue<JoinRequest>()
 
         init {
             holder.addCallback(this)
@@ -287,6 +361,11 @@ class MainActivity : Activity() {
             return stopped
         }
 
+        /** Queues a server join for the render thread. Safe from the UI thread. */
+        fun requestJoin(server: String, name: String, registryPath: String) {
+            joinQueue.offer(JoinRequest(server, name, registryPath))
+        }
+
         private fun releaseBuffers() {
             frameBuffer = null
             bitmap?.recycle()
@@ -328,6 +407,7 @@ class MainActivity : Activity() {
                     // Native calls are confined to this render thread. UI-thread
                     // touch events are queued and delivered here.
                     drainTouchQueue(engineHandle)
+                    drainJoinQueue(engineHandle)
 
                     val now = System.nanoTime()
                     val delta = if (lastFrameNanos == 0L) {
@@ -507,11 +587,37 @@ class MainActivity : Activity() {
             }
         }
 
+        private fun drainJoinQueue(handle: Long) {
+            if (handle == 0L) {
+                return
+            }
+            while (true) {
+                val request = joinQueue.poll() ?: return
+                val accepted = RkbNative.nativeJoinServer(
+                    handle,
+                    request.server,
+                    request.name,
+                    request.registryPath,
+                )
+                if (accepted) {
+                    Log.i(TAG, "join started for ${request.server}")
+                } else {
+                    Log.e(TAG, "join rejected for ${request.server}")
+                }
+            }
+        }
+
         override fun performClick(): Boolean {
             super.performClick()
             return true
         }
     }
+
+    private data class JoinRequest(
+        val server: String,
+        val name: String,
+        val registryPath: String,
+    )
 
     private data class TouchSample(
         val action: Int,

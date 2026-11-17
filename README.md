@@ -19,15 +19,20 @@ persists seed, player pose, and edits.
 > [`docs/horizon-comparison.md`](docs/horizon-comparison.md),
 > [`docs/migration-plan.md`](docs/migration-plan.md),
 > [`docs/m1-verification.md`](docs/m1-verification.md),
-> [`docs/m2-verification.md`](docs/m2-verification.md), and
-> [`docs/m3-verification.md`](docs/m3-verification.md). New protocol work lives
+> [`docs/m2-verification.md`](docs/m2-verification.md),
+> [`docs/m3-verification.md`](docs/m3-verification.md), and
+> [`docs/m4-verification.md`](docs/m4-verification.md), and
+> [`docs/m5-verification.md`](docs/m5-verification.md). New protocol work lives
 > on `feature/mc-java-protocol`.
 
 This is not a complete Minecraft client. It speaks the 1.21.1 status, login,
 configuration, and play protocol, implements Microsoft/Xbox/Minecraft Services
 sign-in, joins an offline-mode world, and stores real server chunks, blocks,
-light, entities, health, and inventory. It does **not** yet render a server
-world, send local movement, or run networking inside the Android app. Real
+light, entities, health, and inventory. The desktop client can join a server and
+render its chunks and live block updates. The Android host can request a
+server join through the same native engine, but an on-device join has not been
+observed. The client does **not** yet send local movement or render entities.
+Real
 account sign-in and an online-mode join remain unverified until a user supplies
 an account and Azure application id. There are no Mojang textures or resource
 packs, dynamic lightmaps or shadows, survival gameplay, or mobs. The project
@@ -38,15 +43,15 @@ procedurally by RKB code.
 
 | Area | State |
 | --- | --- |
-| Rust workspace | Building on stable Rust; 379 unit/integration tests |
+| Rust workspace | Building on stable Rust; 385 unit/integration tests |
 | Renderer | Software RGBA8 rasterizer with primitives, alpha blending, a 2D camera, texture sampling, and a reciprocal-depth perspective 3D path with per-vertex UV/light |
 | Runtime | Fixed timestep, accumulation and drop accounting, lifecycle FSM, resize handling |
 | Input | Multi-touch state, tap/drag/pinch detectors, virtual joystick, touch button |
 | Resources | Traversal-safe paths, memory/file sources, checksummed `RKBPAK1` archives, LRU cache |
 | Minecraft data | 1.21/1.21.1 saved-world reader and atomic writer: NBT, Anvil regions, chunk palettes and construction, block states, registry reports, `rkb-world` CLI |
-| Minecraft protocol | `rkb-proto` + `rkb-net`: 1.21.1 (protocol 767) codecs, framing, zlib, AES/CFB8, RSA/PKCS#1 v1.5, Java server hash, handshake/status/login/configuration packets, and offline- and online-mode login through `FinishConfiguration`, verified against the official 1.21.1 server in offline mode. The play state joins the world, decodes chunk/light/block-update/entity/health/inventory packets, and answers keep-alives, teleports, and chunk batches, also verified against the official server. `rkb-auth` implements Microsoft/Xbox/Minecraft Services sign-in, profile and entitlement checks, refresh tokens, and session-server join; real account sign-in is unverified. Server chunks are not rendered yet |
-| Minecraft client | `rkb-minecraft`: default seeded terrain, save loading, background chunk streaming and face meshing, textured block rendering from a procedural atlas with face shading and ambient occlusion, first-person camera, walking/jumping/flight, AABB collision, raycast break/place, session persistence and autosave. This is the prototype being migrated |
-| Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host that launches the Minecraft client, 0.6x render scaling, status/help overlay, lifecycle and touch wiring |
+| Minecraft protocol | `rkb-proto` + `rkb-net`: 1.21.1 (protocol 767) codecs, framing, zlib, AES/CFB8, RSA/PKCS#1 v1.5, Java server hash, handshake/status/login/configuration packets, and offline- and online-mode login through `FinishConfiguration`, verified against the official 1.21.1 server in offline mode. The play state joins the world, decodes chunk/light/block-update/entity/health/inventory packets, and answers keep-alives, teleports, and chunk batches, also verified against the official server. `rkb-auth` implements Microsoft/Xbox/Minecraft Services sign-in, profile and entitlement checks, refresh tokens, and session-server join; real account sign-in is unverified. `rkb-join` renders server chunks and live block updates through the existing client |
+| Minecraft client | `rkb-minecraft`: default seeded terrain, save loading, server worlds via `rkb-net`, background chunk streaming and face meshing, textured block rendering from a procedural atlas with face shading and ambient occlusion, first-person camera, walking/jumping/flight, AABB collision, raycast break/place, session persistence and autosave. Server worlds are read-only locally until actions are sent to the server |
+| Android | `aarch64-linux-android` JNI library, Kotlin `SurfaceView` host that launches the Minecraft client, 0.6x render scaling, status/help overlay, lifecycle and touch wiring, and a background server-join request (`nativeJoinServer`) that swaps the server world in on the render thread |
 | CI | Format, clippy, tests, release build, generated and saved world renders, NDK ARM64 build, APK and ABI verification, emulator fresh-install and supplied-save assertions |
 
 The software renderer is intentional. It keeps the core testable on any host and
@@ -101,7 +106,8 @@ Implemented:
 Not implemented yet: resource-pack/Mojang textures, biome colour blending,
 dynamic lightmaps and shadows, block shapes (slabs, stairs, fences, and other
 non-cube blocks are treated as full cubes for both rendering and collision),
-inventory, crafting, mobs, survival, sound, and server worlds. The atlas is an
+inventory, crafting, mobs, survival, and sound. Server worlds are read-only:
+local movement and block edits are not sent to the server yet. The atlas is an
 original procedural approximation, not extracted Mojang art. Generated terrain is
 RKB terrain, not Mojang's world generator; it reproduces no vanilla seed.
 
@@ -190,7 +196,18 @@ cargo run -p rkb-net --bin rkb-play -- \
 
 cargo test -p rkb-proto
 cargo test -p rkb-net
+
+# join a server and render its world headlessly (needs your own blocks.json)
+cargo run -p rkb-minecraft --bin rkb-join -- \
+  --server 127.0.0.1:25565 --name RKBJoin \
+  --block-report /path/to/1.21.1/generated/reports/blocks.json \
+  --seconds 30 --out /tmp/rkb-server.ppm
 ```
+
+`rkb-join` uses only server chunks and block updates; it fails instead of
+drawing generated terrain when the server sends nothing. Server worlds are
+read-only locally because M4 does not send movement or block actions yet. See
+[`docs/m4-verification.md`](docs/m4-verification.md).
 
 ### Microsoft sign-in
 
