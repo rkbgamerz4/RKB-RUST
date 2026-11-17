@@ -181,11 +181,25 @@ or successful online-mode join is claimed.
 
 ### M3 — World join and chunk streaming
 
+Status: **implemented and verified against the official 1.21.1 server in
+offline mode** (2026-11-17). Evidence, limits, and the real-chunk fixture are in
+[`m3-verification.md`](m3-verification.md).
+
 - Join game, dimension/registry data, chunk batch and light packets.
 - Client chunk store with paletted sections, heightmaps, block entities.
 - Headless block queries and chunk statistics.
+- Server-to-client entities, health, inventory, chat, and disconnect reasons
+  are decoded as part of the play session. No local movement or container
+  clicks are sent.
 - Gate: for a test server, blocks at sampled coordinates match the server's
-  own state (`/setblock`, `/data`, or a vanilla-client screenshot).
+  own state (`/setblock`, `/data`, or a vanilla-client screenshot). **Met**:
+  a `/setblock` at `(40, -60, 40)` was observed as `minecraft:stone`, and the
+  origin sampled as `minecraft:grass_block[snowy=false]` after a teleport.
+
+Sequencing after M3: connect the received server chunks to the existing
+renderer's world store, then move networking into the Android ARM64 host. Those
+deliverables draw on M6 (renderer) and M7 (Android product path); M4 and M5
+below still describe the full gameplay gates.
 
 ### M4 — Players, entities, and movement
 

@@ -27,7 +27,7 @@ use rkb_proto::packets::{
     ClientInformation, CookieResponse, FinishConfiguration, Handshake, KeepAlive, KnownPack,
     KnownPacks, LoginAcknowledged, LoginCookieRequest, LoginCookieResponse, LoginDisconnect,
     LoginPluginRequest, LoginPluginResponse, LoginStart, LoginSuccess, NextState, PluginMessage,
-    Pong, Property, SetCompression,
+    Pong, Property, RegistryData, SetCompression,
 };
 use rkb_proto::{DATA_VERSION, PROTOCOL_VERSION};
 
@@ -138,7 +138,7 @@ pub struct LoginOutcome {
 
 #[derive(Default)]
 struct ConfigurationSummary {
-    registries: Vec<String>,
+    registries: Vec<RegistryData>,
     feature_flags: Vec<String>,
     known_packs: Vec<KnownPack>,
 }
@@ -148,6 +148,60 @@ struct Session<'a, S> {
     trace: Vec<TraceEntry>,
     trace_enabled: bool,
     authenticator: Option<&'a mut dyn SessionAuthenticator>,
+}
+
+/// A connection that has completed login and configuration and is ready for
+/// the play state.
+///
+/// [`login`] discards this wrapper; a play session keeps it so the verified
+/// login/configuration path is not duplicated.
+pub struct ConfiguredSession<S> {
+    connection: Connection<S>,
+    outcome: LoginOutcome,
+    registries: Vec<RegistryData>,
+}
+
+impl<S> ConfiguredSession<S> {
+    /// What login and configuration observed.
+    #[must_use]
+    pub fn outcome(&self) -> &LoginOutcome {
+        &self.outcome
+    }
+
+    /// The registry packets exactly as the server sent them.
+    ///
+    /// Each entry's value is anonymous NBT; callers parse only what they need.
+    #[must_use]
+    pub fn registries(&self) -> &[RegistryData] {
+        &self.registries
+    }
+
+    /// The framed connection, now in the play state.
+    #[must_use]
+    pub fn connection(&self) -> &Connection<S> {
+        &self.connection
+    }
+
+    /// Mutable access to the framed connection.
+    pub fn connection_mut(&mut self) -> &mut Connection<S> {
+        &mut self.connection
+    }
+
+    /// Splits the session into its connection, outcome, and registry data.
+    #[must_use]
+    pub fn into_parts(self) -> (Connection<S>, LoginOutcome, Vec<RegistryData>) {
+        (self.connection, self.outcome, self.registries)
+    }
+}
+
+impl<S> fmt::Debug for ConfiguredSession<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfiguredSession")
+            .field("outcome", &self.outcome)
+            .field("registries", &self.registries.len())
+            .finish()
+    }
 }
 
 /// Logs in to `address` and completes the configuration state.
@@ -161,6 +215,17 @@ pub fn login(
     options: &LoginOptions,
     authenticator: Option<&mut dyn SessionAuthenticator>,
 ) -> Result<LoginOutcome> {
+    Ok(login_configured(address, timeout, options, authenticator)?.outcome)
+}
+
+/// Like [`login`], but keeps the connection and registry data for a play
+/// session.
+pub fn login_configured(
+    address: &str,
+    timeout: Duration,
+    options: &LoginOptions,
+    authenticator: Option<&mut dyn SessionAuthenticator>,
+) -> Result<ConfiguredSession<TcpStream>> {
     validate_username(&options.username)?;
     let address = ServerAddress::parse(address)?;
     let stream = connect(&address, timeout)?;
@@ -170,7 +235,12 @@ pub fn login(
         trace_enabled: options.trace,
         authenticator,
     };
-    session.run(&address, options)
+    let (outcome, registries) = session.run(&address, options)?;
+    Ok(ConfiguredSession {
+        connection: session.connection,
+        outcome,
+        registries,
+    })
 }
 
 fn validate_username(username: &str) -> Result<()> {
@@ -207,7 +277,11 @@ fn connect(address: &ServerAddress, timeout: Duration) -> Result<TcpStream> {
 }
 
 impl<S: Read + Write> Session<'_, S> {
-    fn run(&mut self, address: &ServerAddress, options: &LoginOptions) -> Result<LoginOutcome> {
+    fn run(
+        &mut self,
+        address: &ServerAddress,
+        options: &LoginOptions,
+    ) -> Result<(LoginOutcome, Vec<RegistryData>)> {
         let handshake = Handshake {
             protocol: PROTOCOL_VERSION,
             host: address.host.clone(),
@@ -285,7 +359,12 @@ impl<S: Read + Write> Session<'_, S> {
                     let success = LoginSuccess::decode(packet_payload(&body))?;
                     self.send("login", &LoginAcknowledged.encode())?;
                     let summary = self.configuration()?;
-                    return Ok(LoginOutcome {
+                    let ConfigurationSummary {
+                        registries,
+                        feature_flags,
+                        known_packs,
+                    } = summary;
+                    let outcome = LoginOutcome {
                         address: address.clone(),
                         protocol: PROTOCOL_VERSION,
                         data_version: DATA_VERSION,
@@ -296,11 +375,15 @@ impl<S: Read + Write> Session<'_, S> {
                         encrypted,
                         session_authenticated,
                         compression,
-                        registries: summary.registries,
-                        feature_flags: summary.feature_flags,
-                        known_packs: summary.known_packs,
+                        registries: registries
+                            .iter()
+                            .map(|registry| registry.registry.clone())
+                            .collect(),
+                        feature_flags,
+                        known_packs,
                         trace: std::mem::take(&mut self.trace),
-                    });
+                    };
+                    return Ok((outcome, registries));
                 }
                 ids::login::clientbound::PLUGIN_REQUEST => {
                     let request = LoginPluginRequest::decode(packet_payload(&body))?;
@@ -378,7 +461,7 @@ impl<S: Read + Write> Session<'_, S> {
                     self.send("configuration", &Pong { id: ping.id }.encode())?;
                 }
                 Clientbound::ResetChat => {}
-                Clientbound::RegistryData(data) => summary.registries.push(data.registry),
+                Clientbound::RegistryData(data) => summary.registries.push(data),
                 Clientbound::RemoveResourcePack(_) => {}
                 Clientbound::AddResourcePack(pack) => {
                     if pack.forced {

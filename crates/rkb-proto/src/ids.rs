@@ -125,3 +125,97 @@ pub mod configuration {
         pub const SERVER_LINKS: i32 = 0x09;
     }
 }
+
+/// Play state (protocol 767).
+///
+/// The names follow the official packet report. Only packets this client
+/// decodes or sends are listed; unknown ids are reported, never guessed.
+pub mod play {
+    /// Clientbound packets.
+    pub mod clientbound {
+        /// `SpawnEntity`.
+        pub const SPAWN_ENTITY: i32 = 0x01;
+        /// `BlockUpdate` (block change).
+        pub const BLOCK_CHANGE: i32 = 0x09;
+        /// `ChunkBatchFinished`.
+        pub const CHUNK_BATCH_FINISHED: i32 = 0x0C;
+        /// `ChunkBatchStart`.
+        pub const CHUNK_BATCH_START: i32 = 0x0D;
+        /// `SetContainerContent` (window items).
+        pub const WINDOW_ITEMS: i32 = 0x13;
+        /// `SetContainerSlot`.
+        pub const SET_SLOT: i32 = 0x15;
+        /// `Disconnect`.
+        pub const KICK_DISCONNECT: i32 = 0x1D;
+        /// `UnloadChunk`.
+        pub const UNLOAD_CHUNK: i32 = 0x21;
+        /// `GameEvent` (game state change).
+        pub const GAME_STATE_CHANGE: i32 = 0x22;
+        /// `KeepAlive`.
+        pub const KEEP_ALIVE: i32 = 0x26;
+        /// `ChunkDataAndUpdateLight`.
+        pub const CHUNK_DATA: i32 = 0x27;
+        /// `UpdateLight`.
+        pub const UPDATE_LIGHT: i32 = 0x2A;
+        /// `Login` (join game).
+        pub const LOGIN: i32 = 0x2B;
+        /// `UpdateEntityPosition`.
+        pub const REL_ENTITY_MOVE: i32 = 0x2E;
+        /// `UpdateEntityPositionAndRotation`.
+        pub const ENTITY_MOVE_LOOK: i32 = 0x2F;
+        /// `UpdateEntityRotation`.
+        pub const ENTITY_LOOK: i32 = 0x30;
+        /// `Ping`.
+        pub const PING: i32 = 0x35;
+        /// `PlayerInfoUpdate`.
+        pub const PLAYER_INFO: i32 = 0x3E;
+        /// `SynchronizePlayerPosition`.
+        pub const SYNC_PLAYER_POSITION: i32 = 0x40;
+        /// `RemoveEntities`.
+        pub const ENTITY_DESTROY: i32 = 0x42;
+        /// `Respawn`.
+        pub const RESPAWN: i32 = 0x47;
+        /// `SetHeldItem`.
+        pub const HELD_ITEM_SLOT: i32 = 0x53;
+        /// `SetExperience`.
+        pub const EXPERIENCE: i32 = 0x5C;
+        /// `SetHealth`.
+        pub const UPDATE_HEALTH: i32 = 0x5D;
+        /// `SetTime`.
+        pub const UPDATE_TIME: i32 = 0x64;
+        /// `StartConfiguration`.
+        pub const START_CONFIGURATION: i32 = 0x69;
+        /// `SystemChatMessage`.
+        pub const SYSTEM_CHAT: i32 = 0x6C;
+        /// `TeleportEntity`.
+        pub const ENTITY_TELEPORT: i32 = 0x70;
+    }
+
+    /// Serverbound packets.
+    pub mod serverbound {
+        /// `AcceptTeleportation`.
+        pub const TELEPORT_CONFIRM: i32 = 0x00;
+        /// `ChunkBatchReceived`.
+        pub const CHUNK_BATCH_RECEIVED: i32 = 0x08;
+        /// `ClientStatus`.
+        pub const CLIENT_COMMAND: i32 = 0x09;
+        /// `ClientInformation`.
+        pub const SETTINGS: i32 = 0x0A;
+        /// `AcknowledgeConfiguration`.
+        pub const CONFIGURATION_ACKNOWLEDGED: i32 = 0x0C;
+        /// `KeepAlive`.
+        pub const KEEP_ALIVE: i32 = 0x18;
+        /// `SetPlayerPosition`.
+        pub const POSITION: i32 = 0x1A;
+        /// `SetPlayerPositionAndRotation`.
+        pub const POSITION_LOOK: i32 = 0x1B;
+        /// `SetPlayerRotation`.
+        pub const LOOK: i32 = 0x1C;
+        /// `SetPlayerMovementFlags`.
+        pub const FLYING: i32 = 0x1D;
+        /// `PingRequest`.
+        pub const PING_REQUEST: i32 = 0x21;
+        /// `Pong`.
+        pub const PONG: i32 = 0x27;
+    }
+}

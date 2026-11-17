@@ -127,6 +127,12 @@ impl<'a> Reader<'a> {
         Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    /// Reads a big-endian `i16`.
+    pub fn read_i16(&mut self) -> Result<i16> {
+        let bytes = self.read_bytes(2)?;
+        Ok(i16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
     /// Reads a big-endian `i64`.
     pub fn read_i64(&mut self) -> Result<i64> {
         let bytes = self.read_bytes(8)?;
@@ -205,6 +211,146 @@ impl<'a> Reader<'a> {
             Ok(None)
         }
     }
+
+    /// Reads one anonymous NBT value and returns its exact bytes, including the
+    /// leading tag id.
+    ///
+    /// Network NBT omits the root name that file NBT carries. RKB does not need
+    /// every NBT field in a play packet, but it must know where the value ends,
+    /// so this validates the structure and skips the payload.
+    pub fn read_anonymous_nbt_raw(&mut self, max_bytes: usize) -> Result<&'a [u8]> {
+        let start = self.position;
+        let tag = self.read_u8()?;
+        if tag == 0 {
+            return Err(Error::protocol("anonymous NBT has TAG_End as its root"));
+        }
+        self.skip_nbt_payload(tag, 0)?;
+        let end = self.position;
+        if end - start > max_bytes {
+            return Err(Error::PacketTooLarge {
+                size: end - start,
+                max: max_bytes,
+            });
+        }
+        Ok(&self.data[start..end])
+    }
+
+    /// Reads an optional anonymous NBT value: tag `0` means absent.
+    ///
+    /// This is the in-packet `Optional NBT` encoding used by block entities and
+    /// some components, where the absence marker is `TAG_End`.
+    pub fn read_optional_nbt_raw(&mut self, max_bytes: usize) -> Result<Option<&'a [u8]>> {
+        if self.data.get(self.position).copied() == Some(0) {
+            self.position += 1;
+            Ok(None)
+        } else {
+            Ok(Some(self.read_anonymous_nbt_raw(max_bytes)?))
+        }
+    }
+
+    /// Reads a boolean-prefixed optional anonymous NBT value.
+    ///
+    /// Registry entries use a boolean presence flag followed by the tag, which
+    /// is a different encoding from [`Self::read_optional_nbt_raw`].
+    pub fn read_prefixed_optional_nbt_raw(&mut self, max_bytes: usize) -> Result<Option<&'a [u8]>> {
+        if self.read_bool()? {
+            Ok(Some(self.read_anonymous_nbt_raw(max_bytes)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn skip_nbt_payload(&mut self, tag: u8, depth: u16) -> Result<()> {
+        if depth > 512 {
+            return Err(Error::protocol("NBT nesting is deeper than 512 levels"));
+        }
+        match tag {
+            1 => {
+                self.read_bytes(1)?;
+            }
+            2 => {
+                self.read_bytes(2)?;
+            }
+            3 => {
+                self.read_bytes(4)?;
+            }
+            4 => {
+                self.read_bytes(8)?;
+            }
+            5 => {
+                self.read_bytes(4)?;
+            }
+            6 => {
+                self.read_bytes(8)?;
+            }
+            7 => {
+                let length = self.read_signed_length("byte array")?;
+                self.read_bytes(length)?;
+            }
+            8 => {
+                let length = self.read_u16()? as usize;
+                self.read_bytes(length)?;
+            }
+            9 => {
+                let element = self.read_u8()?;
+                let count = self.read_signed_length("list")?;
+                if element == 0 {
+                    if count != 0 {
+                        return Err(Error::protocol("NBT list of TAG_End has entries"));
+                    }
+                } else {
+                    for _ in 0..count {
+                        self.skip_nbt_payload(element, depth + 1)?;
+                    }
+                }
+            }
+            10 => loop {
+                let child = self.read_u8()?;
+                if child == 0 {
+                    break;
+                }
+                let name_length = self.read_u16()? as usize;
+                self.read_bytes(name_length)?;
+                self.skip_nbt_payload(child, depth + 1)?;
+            },
+            11 => {
+                let count = self.read_signed_length("int array")?;
+                let length = count
+                    .checked_mul(4)
+                    .ok_or_else(|| Error::protocol("NBT int array length overflows"))?;
+                self.read_bytes(length)?;
+            }
+            12 => {
+                let count = self.read_signed_length("long array")?;
+                let length = count
+                    .checked_mul(8)
+                    .ok_or_else(|| Error::protocol("NBT long array length overflows"))?;
+                self.read_bytes(length)?;
+            }
+            other => {
+                return Err(Error::protocol(format!(
+                    "unknown NBT tag type {other} while skipping"
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    fn read_signed_length(&mut self, what: &str) -> Result<usize> {
+        const MAX_COLLECTION: i32 = 16_777_216;
+        let length = self.read_i32()?;
+        if length < 0 {
+            return Err(Error::protocol(format!(
+                "negative NBT {what} length {length}"
+            )));
+        }
+        if length > MAX_COLLECTION {
+            return Err(Error::protocol(format!(
+                "NBT {what} length {length} exceeds {MAX_COLLECTION}"
+            )));
+        }
+        Ok(length as usize)
+    }
 }
 
 /// A buffer that writes protocol primitives.
@@ -256,6 +402,16 @@ impl Writer {
 
     /// Writes a big-endian `u16`.
     pub fn write_u16(&mut self, value: u16) {
+        self.data.extend_from_slice(&value.to_be_bytes());
+    }
+
+    /// Writes one signed byte.
+    pub fn write_i8(&mut self, value: i8) {
+        self.write_u8(value as u8);
+    }
+
+    /// Writes a big-endian `i16`.
+    pub fn write_i16(&mut self, value: i16) {
         self.data.extend_from_slice(&value.to_be_bytes());
     }
 

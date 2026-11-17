@@ -12,6 +12,10 @@ authors.workspace = true
 name = "rkb-login"
 path = "src/bin/rkb-login.rs"
 
+[[bin]]
+name = "rkb-play"
+path = "src/bin/rkb-play.rs"
+
 [dependencies]
 rkb-proto = { workspace = true }
 rkb-mc = { workspace = true }
