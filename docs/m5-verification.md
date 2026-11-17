@@ -112,8 +112,20 @@ from generated terrain.
 
 `crates/rkb-android` is cross-compiled by `scripts/build-android.sh`, and
 `android.yml` / `android-emulator.yml` build the debug APK for `arm64-v8a` (and
-`x86_64` for the emulator) with the new dependency on `rkb-net`. CI run links
-are recorded below after dispatch.
+`x86_64` for the emulator) with the new dependency on `rkb-net`.
+
+Runs dispatched for commit `b0feea8` on `feature/mc-java-protocol`:
+
+| Workflow | Run | Result |
+| --- | --- | --- |
+| Rust CI | `44021708974` | success |
+| Android ARM64 | `44021714380` | success |
+| Android emulator startup | `44021718681` | success |
+
+This proves the Kotlin declaration, the manifest, the JNI export, and the
+cross-compiled ARM64/x86_64 libraries compile together, and that the app still
+launches and renders its generated world from a fresh install on an API 34
+emulator.
 
 The emulator smoke test still covers the fresh-install generated world and a
 supplied save. It does **not** drive the join dialog, because it has no server
