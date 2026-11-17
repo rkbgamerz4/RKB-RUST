@@ -237,6 +237,27 @@ session, and did not log a token. The server setting was restored to
 - **Play state and a world.** M3–M4. The client still does not decode Join Game,
   chunks, entities, inventory, or health, and does not render a server world.
 
+## CI
+
+Runs dispatched for commit `f635b8f` on `feature/mc-java-protocol`:
+
+| Workflow | Run | Result |
+| --- | --- | --- |
+| Android ARM64 | `44004054788` | success |
+| Android emulator startup | `44004060178` | success |
+| Rust CI | `44004049470` | failure in the `MSRV 1.77` job only |
+
+The MSRV failure was a dependency-resolution problem, not a code or test
+failure. `zeroize` resolved to `1.9.1`, which declares edition 2024 and therefore
+needs Rust 1.85; Cargo 1.77 cannot even parse its manifest. The `format and
+clippy`, `tests`, `release build`, and `Android target check` jobs all passed.
+
+Fix: pin `zeroize = "=1.8.2"` in `crates/rkb-auth`. rustls requires only
+`zeroize 1.8`, and 1.8.2 is edition 2021 with `rust-version = 1.60`, so the
+declared workspace MSRV stays at 1.77. The lock file was updated with
+`cargo update -p zeroize --precise 1.8.2`; the full workspace still reports
+**349 passed, 0 failed, 0 ignored** locally afterwards.
+
 ## Reproduce
 
 ```bash
