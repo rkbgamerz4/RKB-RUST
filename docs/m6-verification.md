@@ -90,6 +90,24 @@ Android-specific: `crates/rkb-android/tests/jni_contract.rs` covers the new
 4-argument `nativeJoinServer`, and `bridge.rs` has a pack-load-failure test that
 asserts a bad pack does not undo a successful join.
 
+### CI on this commit
+
+All three workflows were dispatched with `gh workflow run … --ref
+feature/mc-java-protocol` at commit `959ddee` (push `0f904b2..959ddee`) on
+2026-11-18:
+
+| Workflow | Run | Result | Jobs |
+| --- | --- | --- | --- |
+| Rust CI (`ci.yml`) | `44309477614` | success | Format and clippy, Tests, Release build, Android target check, MSRV 1.77 — all success |
+| Android ARM64 (`android.yml`) | `44309486084` | success | NDK cross-compile and debug APK |
+| Android emulator startup (`android-emulator.yml`) | `44309495050` | success | API 34 emulator launch |
+
+The Rust CI run confirms fmt, `clippy -D warnings`, the test suite, the
+`aarch64-linux-android` target check, and the MSRV 1.77 build on GitHub's
+runners; the Android run produces the ARM64 debug APK. The emulator run still
+covers only fresh-install startup and the generated world — it has no server or
+`blocks.json`, so it is *not* a M6 rendering result.
+
 ## 4. The verification pack (no Mojang assets)
 
 `scripts/m6-verify-pack.py` writes every byte of the pack: 8 PNG textures
@@ -365,9 +383,10 @@ correctly reports `not loaded` instead of inventing geometry.
   join, and a bad pack is reported without aborting the join (unit-tested in
   `bridge.rs`).
 - **Build:** the Android ARM64 cross-compile and debug APK are built by CI
-  (`.github/workflows/android.yml`, `scripts/build-android.sh`). No NDK or
-  Android SDK exists in this Termux environment, so the ARM64 build is verified
-  by CI only, not locally.
+  (`.github/workflows/android.yml`, `scripts/build-android.sh`) — run
+  `44309486084` (success) on this commit (§3). No NDK or Android SDK exists in
+  this Termux environment, so the ARM64 build is verified by CI only, not
+  locally.
 - **M5 join:** unchanged from M5 — the host-tested join path has still not been
   observed on an emulator or physical device. M6 adds no claim here.
 - **GPU:** none. The app presents the software framebuffer through a `Bitmap`
