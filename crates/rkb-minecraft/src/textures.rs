@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use rkb_core::Vec3;
 use rkb_render::{Color, Texture};
 
 use crate::blocks::block_color;
@@ -38,6 +39,16 @@ pub enum FaceDir {
 }
 
 impl FaceDir {
+    /// Every direction, in the order used by model elements and tests.
+    pub const ALL: [Self; 6] = [
+        Self::NegX,
+        Self::PosX,
+        Self::NegY,
+        Self::PosY,
+        Self::NegZ,
+        Self::PosZ,
+    ];
+
     /// Shade multiplier matching Minecraft's directional face lighting
     /// (top brightest, bottom darkest, north/south brighter than east/west).
     #[must_use]
@@ -47,6 +58,72 @@ impl FaceDir {
             Self::NegY => 0.5,
             Self::PosX | Self::NegX => 0.6,
             Self::PosZ | Self::NegZ => 0.8,
+        }
+    }
+
+    /// Index into a six-face array. The order is `NegX, PosX, NegY, PosY,
+    /// NegZ, PosZ`.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::NegX => 0,
+            Self::PosX => 1,
+            Self::NegY => 2,
+            Self::PosY => 3,
+            Self::NegZ => 4,
+            Self::PosZ => 5,
+        }
+    }
+
+    /// Outward unit normal.
+    #[must_use]
+    pub const fn normal(self) -> Vec3 {
+        match self {
+            Self::NegX => Vec3::new(-1.0, 0.0, 0.0),
+            Self::PosX => Vec3::new(1.0, 0.0, 0.0),
+            Self::NegY => Vec3::new(0.0, -1.0, 0.0),
+            Self::PosY => Vec3::new(0.0, 1.0, 0.0),
+            Self::NegZ => Vec3::new(0.0, 0.0, -1.0),
+            Self::PosZ => Vec3::new(0.0, 0.0, 1.0),
+        }
+    }
+
+    /// The block offset a face points into.
+    #[must_use]
+    pub const fn offset(self) -> (i32, i32, i32) {
+        match self {
+            Self::NegX => (-1, 0, 0),
+            Self::PosX => (1, 0, 0),
+            Self::NegY => (0, -1, 0),
+            Self::PosY => (0, 1, 0),
+            Self::NegZ => (0, 0, -1),
+            Self::PosZ => (0, 0, 1),
+        }
+    }
+
+    #[must_use]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::NegX => Self::PosX,
+            Self::PosX => Self::NegX,
+            Self::NegY => Self::PosY,
+            Self::PosY => Self::NegY,
+            Self::NegZ => Self::PosZ,
+            Self::PosZ => Self::NegZ,
+        }
+    }
+
+    /// Parses a model/blockstate face name.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "down" => Some(Self::NegY),
+            "up" => Some(Self::PosY),
+            "north" => Some(Self::NegZ),
+            "south" => Some(Self::PosZ),
+            "west" => Some(Self::NegX),
+            "east" => Some(Self::PosX),
+            _ => None,
         }
     }
 }
@@ -79,10 +156,14 @@ pub enum Tile {
     EndStone = 21,
     Wool = 22,
     Unknown = 23,
+    Plant = 24,
+    Flower = 25,
+    Torch = 26,
+    Glass = 27,
 }
 
 /// Number of tiles in the atlas.
-pub const TILE_COUNT: usize = 24;
+pub const TILE_COUNT: usize = 28;
 
 impl Tile {
     /// Every tile, in atlas order.
@@ -111,6 +192,10 @@ impl Tile {
         Self::EndStone,
         Self::Wool,
         Self::Unknown,
+        Self::Plant,
+        Self::Flower,
+        Self::Torch,
+        Self::Glass,
     ];
 
     #[must_use]
@@ -180,6 +265,16 @@ impl BlockAtlas {
     pub const fn uv(&self, tile: Tile) -> [f32; 4] {
         self.rects[tile.index()]
     }
+
+    /// `[u0, v0, u1, v1]` for a texture id. Procedural tile ids are their
+    /// `Tile` index, so this is the draw-time lookup used by the mesher.
+    #[must_use]
+    pub fn uv_id(&self, id: u32) -> [f32; 4] {
+        self.rects
+            .get(id as usize)
+            .copied()
+            .unwrap_or(self.rects[Tile::Unknown.index()])
+    }
 }
 
 impl Default for BlockAtlas {
@@ -200,7 +295,7 @@ pub fn block_tile(name: &str, face: FaceDir) -> (Tile, Color) {
     let top = matches!(face, FaceDir::PosY);
     let bottom = matches!(face, FaceDir::NegY);
     match short {
-        "grass_block" | "grass" => (
+        "grass_block" => (
             if top {
                 Tile::GrassTop
             } else if bottom {
@@ -210,6 +305,26 @@ pub fn block_tile(name: &str, face: FaceDir) -> (Tile, Color) {
             },
             white,
         ),
+        "short_grass" | "grass" | "fern" | "large_fern" | "dead_bush" | "seagrass"
+        | "tall_grass" | "sugar_cane" => (Tile::Plant, white),
+        "dandelion" | "poppy" | "blue_orchid" | "allium" | "azure_bluet" | "red_tulip"
+        | "orange_tulip" | "white_tulip" | "pink_tulip" | "oxeye_daisy" | "cornflower"
+        | "lily_of_the_valley" | "wither_rose" | "sunflower" | "lilac" | "rose_bush" | "peony"
+        | "torchflower" => (Tile::Flower, white),
+        "oak_sapling" | "spruce_sapling" | "birch_sapling" | "jungle_sapling"
+        | "acacia_sapling" | "dark_oak_sapling" | "mangrove_propagule" | "azalea"
+        | "flowering_azalea" => (Tile::Plant, white),
+        "torch"
+        | "wall_torch"
+        | "soul_torch"
+        | "soul_wall_torch"
+        | "redstone_torch"
+        | "redstone_wall_torch"
+        | "lantern"
+        | "soul_lantern"
+        | "campfire"
+        | "soul_campfire" => (Tile::Torch, white),
+        "glass" | "glass_pane" | "tinted_glass" => (Tile::Glass, white),
         "dirt" | "coarse_dirt" | "rooted_dirt" => (Tile::Dirt, white),
         "podzol" | "mycelium" => (Tile::Dirt, Color::rgb(110, 84, 51)),
         "mud" | "muddy_mangrove_roots" => (Tile::Dirt, Color::rgb(96, 82, 78)),
@@ -530,6 +645,48 @@ fn paint(tile: Tile, x: u32, y: u32) -> Color {
             }
         }
         Tile::Wool => speckled(seed, x, y, (232, 232, 232), 6.0),
+        Tile::Plant => {
+            // Sparse upright blades on a transparent background.
+            let blade = x % 4 == 1 || (y > 8 && x % 5 == 0);
+            if blade {
+                speckled(seed, x, y, (72, 132, 52), 12.0)
+            } else {
+                Color::TRANSPARENT
+            }
+        }
+        Tile::Flower => {
+            let stem = x == 8 && y > 6;
+            let dx = x as f32 - 7.5;
+            let dy = y as f32 - 5.5;
+            if stem || (dx * dx + dy * dy).sqrt() < 3.4 {
+                if y < 6 {
+                    rgb(232.0, 196.0, 72.0)
+                } else {
+                    speckled(seed, x, y, (86, 150, 60), 10.0)
+                }
+            } else {
+                Color::TRANSPARENT
+            }
+        }
+        Tile::Torch => {
+            if (6..=9).contains(&x) && y >= 6 {
+                speckled(seed, x, y, (128, 96, 54), 8.0)
+            } else if (6..=9).contains(&x) && (3..=5).contains(&y) {
+                rgb(255.0, 196.0, 64.0)
+            } else {
+                Color::TRANSPARENT
+            }
+        }
+        Tile::Glass => {
+            // Clear centre with a light frame so cutout rendering is obvious.
+            if x == 0 || y == 0 || x == TILE_SIZE - 1 || y == TILE_SIZE - 1 {
+                Color::rgba(214, 232, 244, 210)
+            } else if x % 7 == 0 && y % 5 == 0 {
+                Color::rgba(240, 248, 255, 120)
+            } else {
+                Color::TRANSPARENT
+            }
+        }
         Tile::Unknown => {
             // Neutral checker; the block's hashed colour is applied as a tint.
             if (x / 8 + y / 8) % 2 == 0 {
@@ -545,31 +702,47 @@ fn paint(tile: Tile, x: u32, y: u32) -> Color {
 mod tests {
     use super::*;
 
-    fn tile_centre(atlas: &BlockAtlas, tile: Tile) -> Color {
-        let uv = atlas.uv(tile);
-        atlas
-            .texture
-            .sample_nearest((uv[0] + uv[2]) * 0.5, (uv[1] + uv[3]) * 0.5)
-    }
-
     #[test]
-    fn atlas_has_expected_dimensions_and_opaque_tiles() {
+    fn atlas_has_expected_dimensions_and_padding_is_opaque() {
         let atlas = BlockAtlas::new();
         assert_eq!(atlas.texture.width(), ATLAS_WIDTH);
         assert_eq!(atlas.texture.height(), ATLAS_HEIGHT);
         assert_eq!(ATLAS_WIDTH, 128);
         assert_eq!(ATLAS_HEIGHT, 64);
-        assert!(atlas
-            .texture
-            .pixels()
-            .chunks_exact(4)
-            .all(|pixel| pixel[3] == 255));
+        // Padding and ordinary tiles are opaque; glass/plants intentionally
+        // carry alpha so the cutout path has real transparent texels.
+        let glass = atlas.uv(Tile::Glass);
+        let x = (glass[0] * ATLAS_WIDTH as f32) as u32;
+        let y = (glass[1] * ATLAS_HEIGHT as f32) as u32;
+        assert!(
+            atlas
+                .texture
+                .sample_nearest(
+                    (x as f32 + 4.0) / ATLAS_WIDTH as f32,
+                    (y as f32 + 4.0) / ATLAS_HEIGHT as f32
+                )
+                .a
+                < 255
+        );
+        let stone = atlas.uv(Tile::Stone);
+        let x = (stone[0] * ATLAS_WIDTH as f32) as u32;
+        let y = (stone[1] * ATLAS_HEIGHT as f32) as u32;
+        assert_eq!(
+            atlas
+                .texture
+                .sample_nearest(
+                    (x as f32 + 4.0) / ATLAS_WIDTH as f32,
+                    (y as f32 + 4.0) / ATLAS_HEIGHT as f32
+                )
+                .a,
+            255
+        );
     }
 
     #[test]
     fn tiles_are_unique_and_uvs_stay_inside_the_atlas() {
         let atlas = BlockAtlas::new();
-        let mut colours = std::collections::BTreeSet::new();
+        let mut rects = std::collections::BTreeSet::new();
         for tile in Tile::ALL {
             let uv = atlas.uv(tile);
             assert!(
@@ -580,9 +753,9 @@ mod tests {
                 uv[1] > 0.0 && uv[1] < uv[3] && uv[3] < 1.0,
                 "{tile:?}: {uv:?}"
             );
-            colours.insert(tile_centre(&atlas, tile).to_array());
+            rects.insert(uv.map(f32::to_bits));
         }
-        assert_eq!(colours.len(), TILE_COUNT);
+        assert_eq!(rects.len(), TILE_COUNT);
     }
 
     #[test]

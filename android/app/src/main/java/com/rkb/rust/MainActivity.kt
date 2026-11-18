@@ -160,27 +160,35 @@ class MainActivity : Activity() {
             setText(defaultBlockReport.absolutePath)
             inputType = InputType.TYPE_CLASS_TEXT
         }
+        val packField = EditText(this).apply {
+            hint = "optional resource pack (.zip or folder); blank = built-in"
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
         layout.addView(serverField)
         layout.addView(nameField)
         layout.addView(reportField)
+        layout.addView(packField)
 
         AlertDialog.Builder(this)
             .setTitle("Join a 1.21.1 server")
             .setMessage(
                 "Offline mode only for now. The world is read-only: local " +
-                    "movement and block edits are not sent to the server yet.",
+                    "movement and block edits are not sent to the server yet. " +
+                    "RKB bundles no Minecraft textures; supply your own pack " +
+                    "or leave the field blank for the built-in atlas.",
             )
             .setView(layout)
             .setPositiveButton("Join") { _, _ ->
                 val server = serverField.text.toString().trim()
                 val name = nameField.text.toString().trim()
                 val report = reportField.text.toString().trim()
+                val pack = packField.text.toString().trim()
                 if (server.isEmpty() || name.isEmpty() || report.isEmpty()) {
                     Toast.makeText(this, "server, name, and report are required", Toast.LENGTH_LONG)
                         .show()
                     return@setPositiveButton
                 }
-                view?.requestJoin(server, name, report)
+                view?.requestJoin(server, name, report, pack)
                 Toast.makeText(this, "Connecting to $server…", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancel", null)
@@ -362,8 +370,8 @@ class MainActivity : Activity() {
         }
 
         /** Queues a server join for the render thread. Safe from the UI thread. */
-        fun requestJoin(server: String, name: String, registryPath: String) {
-            joinQueue.offer(JoinRequest(server, name, registryPath))
+        fun requestJoin(server: String, name: String, registryPath: String, resourcePack: String) {
+            joinQueue.offer(JoinRequest(server, name, registryPath, resourcePack))
         }
 
         private fun releaseBuffers() {
@@ -598,6 +606,7 @@ class MainActivity : Activity() {
                     request.server,
                     request.name,
                     request.registryPath,
+                    request.resourcePack,
                 )
                 if (accepted) {
                     Log.i(TAG, "join started for ${request.server}")
@@ -617,6 +626,7 @@ class MainActivity : Activity() {
         val server: String,
         val name: String,
         val registryPath: String,
+        val resourcePack: String,
     )
 
     private data class TouchSample(

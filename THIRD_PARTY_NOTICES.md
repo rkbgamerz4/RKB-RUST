@@ -61,7 +61,7 @@ bundle or copy:
 RKB RUST does not copy the Zalith layout, does not bundle a Java runtime, and
 does not include those fonts or icons.
 
-## Rust crates used by `rkb-mc`
+## Rust crates used by `rkb-mc` and `rkb-minecraft`
 
 These versions are the ones recorded in `Cargo.lock` for the current build.
 Licenses are taken from each crate's metadata.
@@ -70,6 +70,7 @@ Licenses are taken from each crate's metadata.
 | --- | ---: | --- |
 | `flate2` | 1.1.11 | MIT OR Apache-2.0 |
 | `miniz_oxide` | 0.9.1 | MIT OR Zlib OR Apache-2.0 |
+| `miniz_oxide` (inflate for `rkb-minecraft` PNG/ZIP reading) | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | `crc32fast` | 1.5.5 | MIT OR Apache-2.0 |
 | `adler2` | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
 | `simd-adler32` | 0.3.10 | MIT |
@@ -78,6 +79,13 @@ Licenses are taken from each crate's metadata.
 | `itoa` | 1.0.19 | MIT OR Apache-2.0 |
 | `memchr` | 2.8.3 | Unlicense OR MIT |
 | `zmij` | 1.0.23 | MIT |
+
+`rkb-minecraft` reads user-supplied resource packs with its own PNG and ZIP
+parsers; `miniz_oxide` only performs the DEFLATE/zlib decompression and
+compression those parsers need. No `png`, `zip`, or `image` crate is used, and
+no Minecraft asset is generated, bundled, or redistributed by RKB RUST: every
+texture a pack supplies comes from the pack the user points at, and every
+texture RKB draws itself is drawn by RKB code.
 
 `serde_json` may resolve additional `serde`/`syn` build or optional
 dependencies in `Cargo.lock`; those are MIT OR Apache-2.0 (and

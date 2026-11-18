@@ -2,7 +2,7 @@
 //!
 //! Kept free of JNI types so it can be unit-tested on the host.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -76,6 +76,8 @@ pub struct AndroidEngine {
     destroyed: bool,
     join: Option<Receiver<Result<ServerWorld, String>>>,
     join_status: Option<String>,
+    /// Pack to apply once the join completes, opened off the network thread.
+    join_resource_pack: Option<PathBuf>,
 }
 
 impl AndroidEngine {
@@ -100,6 +102,7 @@ impl AndroidEngine {
             destroyed: false,
             join: None,
             join_status: None,
+            join_resource_pack: None,
         }
     }
 
@@ -107,12 +110,16 @@ impl AndroidEngine {
     ///
     /// The render thread keeps running; [`Self::frame`] swaps in the world when
     /// the connection is ready. Login and the initial chunk burst never block
-    /// the Android UI.
+    /// the Android UI. `resource_pack` is an optional user-supplied pack
+    /// directory or `.zip`; it is opened only after the join succeeds, and a
+    /// bad path is reported through [`Self::join_status`] without aborting
+    /// the join.
     pub fn begin_join(
         &mut self,
         server: String,
         username: String,
         registry_path: PathBuf,
+        resource_pack: Option<PathBuf>,
     ) -> Result<(), String> {
         if self.join.is_some() {
             return Err("a server join is already in progress".to_owned());
@@ -125,6 +132,7 @@ impl AndroidEngine {
         }
         let (sender, receiver) = mpsc::channel();
         self.join_status = Some(format!("connecting to {server}"));
+        self.join_resource_pack = resource_pack;
         self.join = Some(receiver);
         thread::spawn(move || {
             let result = BlockRegistry::from_file(&registry_path)
@@ -148,6 +156,12 @@ impl AndroidEngine {
                 self.join = None;
                 self.join_status = None;
                 self.runtime.game_mut().load_server(server);
+                if let Some(path) = self.join_resource_pack.take() {
+                    if let Err(error) = self.apply_resource_pack(&path) {
+                        // A bad pack must not undo a successful join.
+                        self.join_status = Some(format!("resource pack: {error}"));
+                    }
+                }
             }
             Ok(Err(error)) => {
                 self.join = None;
@@ -165,6 +179,17 @@ impl AndroidEngine {
     #[must_use]
     pub fn join_in_progress(&self) -> bool {
         self.join.is_some()
+    }
+
+    /// Swaps in a user-supplied resource pack and re-meshes the loaded area.
+    ///
+    /// The pack is whatever the user pointed at; nothing is bundled. Returns
+    /// the pack summary for the HUD.
+    fn apply_resource_pack(&mut self, path: &Path) -> Result<String, String> {
+        self.runtime
+            .game_mut()
+            .load_resource_pack(path)
+            .map_err(|error| format!("{}: {error}", path.display()))
     }
 
     /// The latest join status, including failures.
@@ -246,7 +271,7 @@ impl AndroidEngine {
         let stats = game.stats();
         let report = self.runtime.last_report();
         format!(
-            "stage={:?} frames={} fps={:.1} world={} kind={} chunks={}/{} visible={} faces={} tris={} blocks={} edits={} pos=({:.1},{:.1},{:.1}) yaw={:.0} pitch={:.0} fly={} save={} join={} status={}",
+            "stage={:?} frames={} fps={:.1} world={} kind={} chunks={}/{} visible={} faces={} tris={} blocks={} edits={} pos=({:.1},{:.1},{:.1}) yaw={:.0} pitch={:.0} fly={} save={} join={} status={} pack={}",
             self.runtime.stage(),
             report.frame_index,
             report.fps,
@@ -267,7 +292,8 @@ impl AndroidEngine {
             stats.flying,
             game.save_status(),
             self.join_status.as_deref().unwrap_or("idle"),
-            game.status()
+            game.status(),
+            game.resource_pack_status()
         )
     }
 
@@ -355,6 +381,7 @@ mod tests {
                 "127.0.0.1:1".to_owned(),
                 "Tester".to_owned(),
                 std::path::PathBuf::from("/nonexistent/blocks.json"),
+                None,
             )
             .unwrap();
         assert!(engine.join_in_progress());
@@ -402,6 +429,37 @@ mod tests {
         assert!(stats.contains("world=loaded"), "{stats}");
         assert!(stats.contains("RKB Demo Island"), "{stats}");
         assert!(engine.status_text().contains("world=loaded"));
+    }
+
+    #[test]
+    fn resource_pack_load_is_reported_and_leaves_the_engine_running() {
+        let mut engine = AndroidEngine::new(160, 90, None);
+
+        let missing = engine
+            .apply_resource_pack(Path::new("/nonexistent/rkb-pack"))
+            .unwrap_err();
+        assert!(
+            missing.contains("neither a directory nor a .zip"),
+            "{missing}"
+        );
+
+        let dir = rkb_mc::fixture::TempDir::new("android-pack");
+        std::fs::write(
+            dir.path().join("pack.mcmeta"),
+            r#"{"pack":{"pack_format":34,"description":"RKB android fixture"}}"#,
+        )
+        .unwrap();
+        let summary = engine.apply_resource_pack(dir.path()).unwrap();
+        assert!(summary.contains("textures: pack"), "{summary}");
+        assert!(summary.contains("format 34"), "{summary}");
+
+        let mut pixels = vec![0_u8; 160 * 90 * 4];
+        assert!(matches!(
+            engine.frame(&mut pixels, 160, 90, Duration::from_millis(16)),
+            EngineFrame::Presented(_) | EngineFrame::Skipped
+        ));
+        let stats = engine.stats_text();
+        assert!(stats.contains("textures: pack"), "{stats}");
     }
 
     #[test]

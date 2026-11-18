@@ -133,7 +133,9 @@ fn string_arg(env: &mut JNIEnv, value: jstring) -> Option<String> {
 /// Starts an offline-mode server join without blocking the render thread.
 ///
 /// `registry_path` must point at a `blocks.json` report the user generated from
-/// their own 1.21.1 installation; RKB bundles no Mojang data.
+/// their own 1.21.1 installation; RKB bundles no Mojang data. `resource_pack`
+/// is an optional path to a user-supplied pack directory or `.zip`; an empty
+/// or null value keeps the built-in procedural atlas.
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "system" fn Java_com_rkb_rust_RkbNative_nativeJoinServer(
@@ -143,6 +145,7 @@ pub extern "system" fn Java_com_rkb_rust_RkbNative_nativeJoinServer(
     server: jstring,
     name: jstring,
     registry_path: jstring,
+    resource_pack: jstring,
 ) -> jboolean {
     let Some(engine) = (unsafe { engine_mut(handle) }) else {
         log(LOG_ERROR, "nativeJoinServer: invalid engine handle");
@@ -160,7 +163,17 @@ pub extern "system" fn Java_com_rkb_rust_RkbNative_nativeJoinServer(
         log(LOG_ERROR, "nativeJoinServer: block report path is missing");
         return JNI_FALSE;
     };
-    match engine.begin_join(server, name, PathBuf::from(registry)) {
+    let pack = string_arg(&mut env, resource_pack)
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    if let Some(path) = &pack {
+        log(
+            LOG_INFO,
+            &format!("nativeJoinServer: resource pack {}", path.display()),
+        );
+    }
+    match engine.begin_join(server, name, PathBuf::from(registry), pack) {
         Ok(()) => {
             log(LOG_INFO, "nativeJoinServer: connection started");
             JNI_TRUE

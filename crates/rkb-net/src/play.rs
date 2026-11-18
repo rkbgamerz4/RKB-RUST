@@ -30,14 +30,15 @@ use rkb_proto::ids;
 use rkb_proto::packets::play::{
     BlockChange, BlockPos, ChunkBatchFinished, ChunkBatchReceived, ChunkColumn, ChunkData,
     ConfigurationAcknowledged, EntityDestroy, EntityLook, EntityMoveLook, EntityTeleport,
-    Experience, GameStateChange, HeldItem, JoinGame, KeepAlive, KickDisconnect, LightData, Ping,
-    Pong, RelativeEntityMove, Respawn, SetSlot, Slot, SpawnEntity, SyncPlayerPosition, SystemChat,
+    Experience, GameStateChange, HeldItem, JoinGame, KeepAlive, KickDisconnect, Ping, Pong,
+    RelativeEntityMove, Respawn, SetSlot, Slot, SpawnEntity, SyncPlayerPosition, SystemChat,
     TeleportConfirm, UnloadChunk, UpdateHealth, UpdateLight, UpdateTime, WindowItems,
 };
 use rkb_proto::packets::RegistryData;
 
 use crate::chat;
 use crate::connection::Connection;
+use crate::light::ChunkLight;
 use crate::login::{ConfiguredSession, LoginOutcome};
 
 /// Maximum identifier length accepted from a play packet.
@@ -243,7 +244,9 @@ pub struct PlaySession<S> {
     chunks: BTreeMap<(i32, i32), ChunkColumn>,
     block_updates: BTreeMap<BlockPos, u32>,
     entities: BTreeMap<i32, EntityState>,
-    light_updates: BTreeMap<(i32, i32), LightData>,
+    /// Decoded sky/block light per chunk column, merged from chunk data and
+    /// later `UpdateLight` packets.
+    chunk_light: BTreeMap<(i32, i32), ChunkLight>,
     windows: BTreeMap<u8, Vec<Slot>>,
     stats: PlayStats,
     batch_started: Option<Instant>,
@@ -289,7 +292,7 @@ impl<S: Read + Write> PlaySession<S> {
             chunks: BTreeMap::new(),
             block_updates: BTreeMap::new(),
             entities: BTreeMap::new(),
-            light_updates: BTreeMap::new(),
+            chunk_light: BTreeMap::new(),
             windows: BTreeMap::new(),
             stats: PlayStats::default(),
             batch_started: None,
@@ -333,10 +336,20 @@ impl<S: Read + Write> PlaySession<S> {
         &self.entities
     }
 
-    /// Light-only updates that arrived after their chunk.
+    /// Decoded light for one chunk column, if it has arrived.
+    ///
+    /// The value is merged across the chunk's initial `LightData` and every
+    /// later `UpdateLight` packet for that column, so a partial light update
+    /// never discards sections the server did not name.
     #[must_use]
-    pub fn light_updates(&self) -> &BTreeMap<(i32, i32), LightData> {
-        &self.light_updates
+    pub fn chunk_light(&self, x: i32, z: i32) -> Option<&ChunkLight> {
+        self.chunk_light.get(&(x, z))
+    }
+
+    /// Number of chunk columns with decoded light.
+    #[must_use]
+    pub fn light_columns(&self) -> usize {
+        self.chunk_light.len()
     }
 
     /// Block changes received after the chunk was sent.
@@ -432,7 +445,7 @@ impl<S: Read + Write> PlaySession<S> {
             clientbound::UNLOAD_CHUNK => {
                 let packet = UnloadChunk::decode(payload)?;
                 self.chunks.remove(&(packet.x, packet.z));
-                self.light_updates.remove(&(packet.x, packet.z));
+                self.chunk_light.remove(&(packet.x, packet.z));
                 Ok(Event::ChunkUnloaded {
                     x: packet.x,
                     z: packet.z,
@@ -440,8 +453,14 @@ impl<S: Read + Write> PlaySession<S> {
             }
             clientbound::UPDATE_LIGHT => {
                 let packet = UpdateLight::decode(payload)?;
-                self.light_updates
-                    .insert((packet.chunk_x, packet.chunk_z), packet.light.clone());
+                let min_section_y = self
+                    .dimensions
+                    .get(&self.player.dimension_type)
+                    .map_or(0, |dimension| dimension.min_y >> 4);
+                self.chunk_light
+                    .entry((packet.chunk_x, packet.chunk_z))
+                    .or_default()
+                    .apply(&packet.light, min_section_y);
                 Ok(Event::LightUpdated {
                     chunk_x: packet.chunk_x,
                     chunk_z: packet.chunk_z,
@@ -589,7 +608,7 @@ impl<S: Read + Write> PlaySession<S> {
                 self.player.has_position = false;
                 self.chunks.clear();
                 self.block_updates.clear();
-                self.light_updates.clear();
+                self.chunk_light.clear();
                 self.entities.clear();
                 Ok(Event::Respawned(packet))
             }
@@ -675,7 +694,7 @@ impl<S: Read + Write> PlaySession<S> {
         self.player.has_position = false;
         self.chunks.clear();
         self.block_updates.clear();
-        self.light_updates.clear();
+        self.chunk_light.clear();
         self.entities.clear();
     }
 
@@ -713,6 +732,7 @@ impl<S: Read + Write> PlaySession<S> {
     fn store_chunk(&mut self, packet: ChunkData) -> Result<Event> {
         let dimension = self.dimension(self.player.dimension_type)?;
         let sections = dimension.section_count();
+        let min_section_y = dimension.min_y >> 4;
         let column =
             ChunkColumn::decode(packet.x, packet.z, dimension.min_y, &packet.data, sections)?;
         let event = Event::ChunkLoaded {
@@ -723,6 +743,12 @@ impl<S: Read + Write> PlaySession<S> {
             block_entities: packet.block_entities.len(),
         };
         self.chunks.insert((packet.x, packet.z), column);
+        // A chunk packet carries the column's initial light. A later
+        // `UpdateLight` merges into this snapshot instead of replacing it.
+        self.chunk_light.insert(
+            (packet.x, packet.z),
+            ChunkLight::decode(&packet.light, min_section_y),
+        );
         Ok(event)
     }
 
@@ -841,7 +867,7 @@ mod tests {
 
     use super::*;
     use rkb_proto::codec::Writer;
-    use rkb_proto::packets::play::{GameStateChange, PalettedContainer};
+    use rkb_proto::packets::play::{BitSet, GameStateChange, LightData, PalettedContainer};
 
     /// One shared in-memory pipe: bytes written by the test are read by the
     /// session, and the session's replies land in `server`.
@@ -1055,6 +1081,51 @@ mod tests {
         // Below the dimension and outside sent chunks stay unknown.
         assert_eq!(session.block_state(0, -80, 0), None);
         assert_eq!(session.block_state(16, 0, 0), None);
+    }
+
+    #[test]
+    fn chunk_light_is_decoded_and_merged() {
+        let mut packet = chunk_packet();
+        // Bit 1 is the dimension's minimum section (-4 -> Y -64) because bit 0
+        // is the section below the world.
+        packet.light = LightData {
+            sky_light_mask: BitSet::from_words(vec![0b10]),
+            block_light_mask: BitSet::from_words(vec![0b10]),
+            empty_sky_light_mask: BitSet::default(),
+            empty_block_light_mask: BitSet::default(),
+            sky_light: vec![vec![0x77; 2048]],
+            block_light: vec![vec![0x33; 2048]],
+        };
+        let (mut first, _pipe) =
+            session(&[join_game().encode().unwrap(), packet.encode().unwrap()]);
+        first.next_event().unwrap();
+        first.next_event().unwrap();
+        let light = first.chunk_light(0, 0).expect("chunk light");
+        assert!(light.has_data());
+        assert_eq!(light.sample(0, -64, 0), (7, 3));
+        assert_eq!(first.light_columns(), 1);
+        let update = UpdateLight {
+            chunk_x: 0,
+            chunk_z: 0,
+            light: LightData {
+                sky_light_mask: BitSet::from_words(vec![0b10]),
+                block_light_mask: BitSet::default(),
+                empty_sky_light_mask: BitSet::default(),
+                empty_block_light_mask: BitSet::default(),
+                sky_light: vec![vec![0x55; 2048]],
+                block_light: Vec::new(),
+            },
+        };
+        let (mut merged, _pipe) = session(&[
+            join_game().encode().unwrap(),
+            packet.encode().unwrap(),
+            update.encode().unwrap(),
+        ]);
+        merged.next_event().unwrap();
+        merged.next_event().unwrap();
+        merged.next_event().unwrap();
+        let light = merged.chunk_light(0, 0).expect("merged light");
+        assert_eq!(light.sample(0, -64, 0), (5, 3));
     }
 
     #[test]

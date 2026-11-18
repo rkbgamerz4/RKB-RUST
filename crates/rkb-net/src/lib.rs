@@ -17,11 +17,13 @@
 
 pub mod chat;
 pub mod connection;
+pub mod light;
 pub mod login;
 pub mod play;
 pub mod server;
 
 pub use connection::Connection;
+pub use light::ChunkLight;
 pub use login::{
     login, login_configured, ConfiguredSession, Direction, LoginOptions, LoginOutcome,
     SessionAuthenticator, TraceEntry,

@@ -54,6 +54,7 @@ object RkbNative {
         server: String,
         name: String,
         registryPath: String,
+        resourcePack: String,
     ): Boolean
     external fun nativePause(handle: Long): Boolean
     external fun nativeResume(handle: Long): Boolean

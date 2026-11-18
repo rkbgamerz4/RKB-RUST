@@ -18,6 +18,7 @@ use rkb_mc::{BlockRegistry, BlockState, Chunk, Section};
 use rkb_proto::error::{Error, Result};
 use rkb_proto::packets::play::{ChunkColumn, PalettedContainer};
 
+use crate::light::ChunkLight;
 use crate::login::ConfiguredSession;
 use crate::play::{Event, PlaySession};
 
@@ -46,6 +47,7 @@ pub struct ServerWorld {
     reader: Option<JoinHandle<()>>,
     shutdown: TcpStream,
     chunks: BTreeMap<(i32, i32), Arc<Chunk>>,
+    lights: BTreeMap<(i32, i32), ChunkLight>,
     overrides: BTreeMap<(i32, i32, i32), BlockState>,
     position: Option<ServerPosition>,
     position_dirty: bool,
@@ -54,6 +56,8 @@ pub struct ServerWorld {
     error: Option<String>,
     chunks_received: usize,
     block_updates: usize,
+    unloads: usize,
+    resets: usize,
 }
 
 impl std::fmt::Debug for ServerWorld {
@@ -70,7 +74,15 @@ impl std::fmt::Debug for ServerWorld {
 }
 
 enum Update {
-    Chunk(Chunk),
+    Chunk {
+        chunk: Chunk,
+        light: Option<ChunkLight>,
+    },
+    Light {
+        x: i32,
+        z: i32,
+        light: ChunkLight,
+    },
     Unload {
         x: i32,
         z: i32,
@@ -133,8 +145,22 @@ impl ServerWorld {
                     let Some(column) = session.chunk(x, z).cloned() else {
                         continue;
                     };
-                    buffered.push(Update::Chunk(chunk_from_column(&column, &registry)?));
+                    buffered.push(Update::Chunk {
+                        chunk: chunk_from_column(&column, &registry)?,
+                        light: session.chunk_light(x, z).cloned(),
+                    });
                     received += 1;
+                }
+                Event::LightUpdated {
+                    chunk_x, chunk_z, ..
+                } => {
+                    if let Some(light) = session.chunk_light(chunk_x, chunk_z).cloned() {
+                        buffered.push(Update::Light {
+                            x: chunk_x,
+                            z: chunk_z,
+                            light,
+                        });
+                    }
                 }
                 Event::BlockChanged(change) => {
                     let state = block_state(&registry, change.state_id)?;
@@ -190,6 +216,7 @@ impl ServerWorld {
             reader: Some(reader),
             shutdown,
             chunks: BTreeMap::new(),
+            lights: BTreeMap::new(),
             overrides: BTreeMap::new(),
             position: Some(position),
             position_dirty: true,
@@ -198,6 +225,8 @@ impl ServerWorld {
             error: None,
             chunks_received: received,
             block_updates: 0,
+            unloads: 0,
+            resets: 0,
         })
     }
 
@@ -209,7 +238,7 @@ impl ServerWorld {
         let mut dirty = Vec::new();
         while let Ok(update) = self.receiver.try_recv() {
             match update {
-                Update::Chunk(mut chunk) => {
+                Update::Chunk { mut chunk, light } => {
                     let key = (chunk.x, chunk.z);
                     for (&(x, y, z), state) in &self.overrides {
                         if x.div_euclid(16) == key.0 && z.div_euclid(16) == key.1 {
@@ -217,11 +246,26 @@ impl ServerWorld {
                         }
                     }
                     self.chunks.insert(key, Arc::new(chunk));
+                    if let Some(light) = light {
+                        self.lights.insert(key, light);
+                    }
                     self.chunks_received += 1;
                     dirty.push(key);
                 }
+                Update::Light { x, z, light } => {
+                    let key = (x, z);
+                    let changed = self.lights.get(&key) != Some(&light);
+                    self.lights.insert(key, light);
+                    if changed {
+                        // Vertex light is baked into chunk meshes, so a light
+                        // change only dirties the affected column.
+                        dirty.push(key);
+                    }
+                }
                 Update::Unload { x, z } => {
                     self.chunks.remove(&(x, z));
+                    self.lights.remove(&(x, z));
+                    self.unloads += 1;
                 }
                 Update::Block { x, y, z, state } => {
                     self.overrides.insert((x, y, z), state.clone());
@@ -243,7 +287,9 @@ impl ServerWorld {
                 }
                 Update::Reset => {
                     self.chunks.clear();
+                    self.lights.clear();
                     self.overrides.clear();
+                    self.resets += 1;
                 }
                 Update::Message(message) => self.message = Some(message),
                 Update::Disconnected(reason) => self.disconnected = Some(reason),
@@ -280,6 +326,46 @@ impl ServerWorld {
     #[must_use]
     pub fn block_updates(&self) -> usize {
         self.block_updates
+    }
+
+    /// Number of chunk columns the server unloaded after the join.
+    #[must_use]
+    pub fn unloads(&self) -> usize {
+        self.unloads
+    }
+
+    /// Number of respawn/dimension resets received after the join.
+    #[must_use]
+    pub fn resets(&self) -> usize {
+        self.resets
+    }
+
+    /// Packed sky/block light at absolute coordinates from real server data.
+    ///
+    /// A column whose light has not arrived, or a section the server did not
+    /// describe, returns the documented full-sky fallback `(15, 0)`. Use
+    /// [`Self::has_light`] to report that fallback rather than presenting it
+    /// as decoded light.
+    #[must_use]
+    pub fn light_at(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
+        self.lights
+            .get(&(x.div_euclid(16), z.div_euclid(16)))
+            .map_or((15, 0), |light| light.sample(x, y, z))
+    }
+
+    /// Whether this column has decoded server light at all.
+    #[must_use]
+    pub fn has_light(&self, x: i32, z: i32) -> bool {
+        self.lights.get(&(x, z)).is_some_and(ChunkLight::has_data)
+    }
+
+    /// Number of resident columns with decoded light arrays.
+    #[must_use]
+    pub fn light_columns(&self) -> usize {
+        self.lights
+            .values()
+            .filter(|light| light.has_data())
+            .count()
     }
 
     /// Block at absolute coordinates from server data only.
@@ -348,10 +434,23 @@ fn reader_loop(
         let update = match session.next_event() {
             Ok(Event::ChunkLoaded { x, z, .. }) => match session.chunk(x, z) {
                 Some(column) => match chunk_from_column(column, &registry) {
-                    Ok(chunk) => Update::Chunk(chunk),
+                    Ok(chunk) => Update::Chunk {
+                        chunk,
+                        light: session.chunk_light(x, z).cloned(),
+                    },
                     Err(error) => {
                         Update::Error(format!("chunk ({x}, {z}) could not be converted: {error}"))
                     }
+                },
+                None => continue,
+            },
+            Ok(Event::LightUpdated {
+                chunk_x, chunk_z, ..
+            }) => match session.chunk_light(chunk_x, chunk_z).cloned() {
+                Some(light) => Update::Light {
+                    x: chunk_x,
+                    z: chunk_z,
+                    light,
                 },
                 None => continue,
             },

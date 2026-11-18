@@ -20,19 +20,22 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rkb_core::{Rect, Stage, Vec2, Vec3};
 use rkb_input::{TouchButton, TouchEvent, TouchId, TouchPhase, VirtualJoystick};
 use rkb_mc::{BlockState, World};
 use rkb_net::ServerWorld;
-use rkb_render::{Color, DrawList, Vertex3D};
+use rkb_render::{Color, DrawList, Texture, Vertex3D};
 use rkb_runtime::{Game, UpdateContext};
 
 use crate::camera::Camera;
 use crate::demo_world;
 use crate::interaction::{raycast, RayHit};
-use crate::mesh::{build_chunk_mesh, is_solid_block, ChunkMesh, EditMap};
+use crate::mesh::{build_chunk_mesh_with, is_solid_block, ChunkMesh, EditMap};
+use crate::model::{BlockModelSource, BuiltinModels, RenderLayer};
+use crate::pack::{self, PackModels, ResourcePack};
 use crate::player::{BlockQuery, MoveInput, Player};
 use crate::session::{self, PlayerSnapshot, Session};
 use crate::textures::BlockAtlas;
@@ -52,8 +55,26 @@ const AUTOSAVE_SECONDS: f32 = 20.0;
 /// The playable world border used by current Java Edition worlds.
 const WORLD_BORDER: f32 = 29_999_984.0;
 /// Distance fog blends terrain into the sky between these distances (blocks).
-const FOG_START: f32 = 36.0;
-const FOG_END: f32 = 64.0;
+///
+/// The far edge is derived from the chunk load radius so terrain always fades
+/// into the sky before the outermost meshed ring; the near edge keeps the
+/// historical 36/64 ratio as a fraction of it. Hardcoded distances drift out
+/// of step with `LOAD_RADIUS` and expose the mesh edge as a hard line.
+const FOG_END: f32 = ((LOAD_RADIUS + 1) as f32) * 16.0;
+const FOG_START: f32 = FOG_END * 0.5625;
+
+/// Fog amount for a distance in blocks: 0 before [`FOG_START`], 1 at and
+/// beyond [`FOG_END`].
+fn fog_amount(distance: f32) -> f32 {
+    ((distance - FOG_START) / (FOG_END - FOG_START)).clamp(0.0, 1.0)
+}
+
+/// Fog colour is the sky at the horizon, so distant terrain dissolves into
+/// the band the sky gradient draws there instead of a separate grey. The sky
+/// stays fixed until the server's `UpdateTime` is decoded.
+fn fog_color() -> Color {
+    SKY_HORIZON
+}
 
 const SKY_ZENITH: Color = Color::rgb(58, 108, 196);
 const SKY_HORIZON: Color = Color::rgb(171, 208, 240);
@@ -81,6 +102,22 @@ pub struct GameStats {
     pub faces: usize,
     pub triangles: u32,
     pub edits: usize,
+    /// Blocks drawn as a full cube because no precise built-in shape exists.
+    pub missing_models: usize,
+    /// Translucent faces across resident meshes.
+    pub translucent_faces: usize,
+    /// Server columns with decoded light.
+    pub light_columns: usize,
+    /// Server block updates applied to resident columns since the join.
+    pub block_updates: usize,
+    /// Chunk columns the server has delivered since the join.
+    pub chunks_received: usize,
+    /// Chunk columns the server has unloaded since the join.
+    pub unloads: usize,
+    /// Respawn/dimension resets received since the join.
+    pub resets: usize,
+    /// True when the current world uses the documented full-sky light fallback.
+    pub light_fallback: bool,
     pub frames: u64,
     pub flying: bool,
     pub on_ground: bool,
@@ -94,6 +131,91 @@ pub struct GameStats {
 struct LookDrag {
     id: TouchId,
     last: Vec2,
+}
+
+/// A loaded resource pack: its resolved models plus the atlas built from the
+/// pack's textures.
+#[derive(Debug)]
+struct PackRuntime {
+    models: PackModels,
+    atlas: pack::Atlas,
+}
+
+/// Which shapes and textures the mesher and draw list are currently using.
+///
+/// The default is [`ActiveTextures::Builtin`]: built-in block shapes and the
+/// procedural atlas drawn by this project. [`ActiveTextures::Pack`] replaces
+/// both with whatever the user loaded, and every texture in it comes from that
+/// pack rather than from any bundled asset.
+#[derive(Debug)]
+enum ActiveTextures {
+    Builtin(BlockAtlas),
+    Pack(PackRuntime),
+}
+
+impl Default for ActiveTextures {
+    fn default() -> Self {
+        Self::Builtin(BlockAtlas::new())
+    }
+}
+
+impl ActiveTextures {
+    /// Model source handed to the mesher.
+    fn models(&self) -> &dyn BlockModelSource {
+        match self {
+            Self::Builtin(_) => &BuiltinModels,
+            Self::Pack(runtime) => &runtime.models,
+        }
+    }
+
+    /// `[u0, v0, u1, v1]` for one texture id.
+    fn uv_id(&self, id: u32) -> [f32; 4] {
+        match self {
+            Self::Builtin(atlas) => atlas.uv_id(id),
+            Self::Pack(runtime) => runtime.atlas.uv_id(id),
+        }
+    }
+
+    /// Atlas texture shared with the draw list.
+    fn texture(&self) -> Arc<Texture> {
+        match self {
+            Self::Builtin(atlas) => atlas.texture(),
+            Self::Pack(runtime) => runtime.atlas.texture(),
+        }
+    }
+
+    /// Rebuilds a pack atlas after new textures were decoded. Built-in
+    /// atlases are static, so this is a no-op for them.
+    fn refresh(&mut self) {
+        if let Self::Pack(runtime) = self {
+            let store = runtime.models.store();
+            runtime.atlas.rebuild(&store);
+        }
+    }
+
+    /// Pack path and counters, or a note that the built-in atlas is active.
+    fn status(&self) -> String {
+        match self {
+            Self::Builtin(_) => "textures: built-in procedural atlas".to_owned(),
+            Self::Pack(runtime) => {
+                let pack = runtime.models.pack();
+                let mut text = format!(
+                    "textures: pack {} ({} textures, {} unmodelled, {} missing)",
+                    pack.origin,
+                    runtime.models.texture_count(),
+                    runtime.models.unmodelled_blocks(),
+                    runtime.models.missing_textures(),
+                );
+                if let Some(format) = pack.pack_format {
+                    text.push_str(&format!(", format {format}"));
+                }
+                if let Some(error) = runtime.models.first_error() {
+                    text.push_str(&format!("; first error: {error}"));
+                }
+                text
+            }
+        }
+    }
 }
 
 /// The playable client.
@@ -126,8 +248,10 @@ pub struct MinecraftGame {
     save_clock: f32,
     save_dirty: bool,
     last_error: Option<String>,
-    /// Procedural block atlas shared with the draw list each frame.
-    atlas: BlockAtlas,
+    /// Block shapes and the atlas shared with the draw list each frame.
+    textures: ActiveTextures,
+    /// Vertical field of view in radians (Minecraft's default is 70°).
+    camera_fov_y: f32,
 }
 
 impl MinecraftGame {
@@ -167,7 +291,8 @@ impl MinecraftGame {
             save_clock: 0.0,
             save_dirty: false,
             last_error: None,
-            atlas: BlockAtlas::new(),
+            textures: ActiveTextures::default(),
+            camera_fov_y: 70.0_f32.to_radians(),
         };
         game.layout(viewport);
         match world_path {
@@ -344,6 +469,68 @@ impl MinecraftGame {
         &self.save_status
     }
 
+    /// Human-readable lighting source for the HUD and `rkb-join`.
+    #[must_use]
+    pub fn light_status(&self) -> String {
+        match self.world.as_ref() {
+            None => "light: no world".to_owned(),
+            Some(WorldState::Server(world)) if world.light_columns() > 0 => {
+                format!(
+                    "light: server LightData ({} columns)",
+                    world.light_columns()
+                )
+            }
+            Some(WorldState::Server(_)) => {
+                "light: full-sky fallback (server sent no light yet)".to_owned()
+            }
+            Some(world) => format!(
+                "light: full-sky fallback ({} worlds do not decode light)",
+                world.kind_name()
+            ),
+        }
+    }
+
+    /// Loads a user-supplied resource pack (a directory or `.zip` archive)
+    /// and re-meshes every resident chunk against its blockstates, models,
+    /// and textures.
+    ///
+    /// Only `path` is read: no asset is bundled or cached by RKB, and the
+    /// built-in procedural atlas stays available until this succeeds. Loading
+    /// again replaces the previous pack, which is how a pack is reloaded.
+    /// Returns a human-readable summary for the HUD.
+    pub fn load_resource_pack(&mut self, path: &Path) -> Result<String, String> {
+        let pack = ResourcePack::open(path).map_err(|error| error.to_string())?;
+        let models = PackModels::new(pack);
+        let atlas = pack::Atlas::build(&models.store());
+        let textures = ActiveTextures::Pack(PackRuntime { models, atlas });
+        let summary = textures.status();
+        self.textures = textures;
+        // Every face may now use different geometry and texture ids, so the
+        // whole loaded area is queued again rather than kept as-is.
+        self.meshes.clear();
+        self.center = None;
+        self.ensure_area();
+        self.message = format!("Resource pack loaded from {}.", path.display());
+        Ok(summary)
+    }
+
+    /// Drops a loaded pack and returns to the built-in shapes and atlas.
+    pub fn clear_resource_pack(&mut self) {
+        if matches!(self.textures, ActiveTextures::Pack(_)) {
+            self.textures = ActiveTextures::default();
+            self.meshes.clear();
+            self.center = None;
+            self.ensure_area();
+            self.message = "Resource pack cleared; using built-in textures.".to_owned();
+        }
+    }
+
+    /// Active texture source: pack path, counters, or the built-in atlas.
+    #[must_use]
+    pub fn resource_pack_status(&self) -> String {
+        self.textures.status()
+    }
+
     #[must_use]
     pub fn stats(&self) -> GameStats {
         GameStats {
@@ -356,6 +543,21 @@ impl MinecraftGame {
             faces: self.meshes.values().map(ChunkMesh::face_count).sum(),
             triangles: self.triangles,
             edits: self.edits.len(),
+            missing_models: self.meshes.values().map(|mesh| mesh.missing_models).sum(),
+            translucent_faces: self
+                .meshes
+                .values()
+                .map(|mesh| mesh.translucent.len())
+                .sum(),
+            light_columns: self.world.as_ref().map_or(0, WorldState::light_columns),
+            block_updates: self.world.as_ref().map_or(0, WorldState::block_updates),
+            chunks_received: self.world.as_ref().map_or(0, WorldState::chunks_received),
+            unloads: self.world.as_ref().map_or(0, WorldState::unloads),
+            resets: self.world.as_ref().map_or(0, WorldState::resets),
+            light_fallback: match self.world.as_ref() {
+                Some(world) => world.uses_light_fallback(),
+                None => true,
+            },
             frames: self.frames,
             flying: self.player.flying,
             on_ground: self.player.on_ground,
@@ -382,6 +584,18 @@ impl MinecraftGame {
         self.player.pitch = pitch.clamp(-1.553, 1.553);
     }
 
+    /// Sets the vertical field of view in degrees, clamped to the same
+    /// 30°–110° range as vanilla's FOV slider.
+    pub fn set_fov_degrees(&mut self, degrees: f32) {
+        self.camera_fov_y = degrees.clamp(30.0, 110.0).to_radians();
+    }
+
+    /// Current vertical field of view in degrees.
+    #[must_use]
+    pub fn fov_degrees(&self) -> f32 {
+        self.camera_fov_y.to_degrees()
+    }
+
     #[must_use]
     pub fn spawn(&self) -> Vec3 {
         self.spawn
@@ -398,6 +612,7 @@ impl MinecraftGame {
         let mut camera = Camera::new(self.player.eye());
         camera.yaw = self.player.yaw;
         camera.pitch = self.player.pitch;
+        camera.fov_y = self.camera_fov_y;
         camera
     }
 
@@ -889,7 +1104,7 @@ impl MinecraftGame {
             self.queue.push_back((cx, cz));
             return true;
         }
-        let result = build_chunk_mesh(world, cx, cz, &self.edits);
+        let result = build_chunk_mesh_with(world, cx, cz, &self.edits, self.textures.models());
         match result {
             Ok(Some(mesh)) => {
                 self.meshes.insert((cx, cz), mesh);
@@ -900,6 +1115,8 @@ impl MinecraftGame {
                 self.message = format!("Chunk ({cx}, {cz}) failed to load: {error}");
             }
         }
+        // Textures decoded while meshing join the atlas before the next frame.
+        self.textures.refresh();
         true
     }
 
@@ -944,18 +1161,23 @@ impl MinecraftGame {
         let mut out = [Vertex3D::new(0.0, 0.0, 1.0, 1.0); 8];
         let mut triangles = 0_u32;
         let mut visible_chunks = 0_usize;
-        let atlas = &self.atlas;
+        let atlas = &self.textures;
+        let mut translucent = Vec::new();
 
         for mesh in self.meshes.values() {
-            if mesh.faces.is_empty() || !frustum.contains_aabb(mesh.min, mesh.max) {
+            if mesh.is_empty() || !frustum.contains_aabb(mesh.min, mesh.max) {
                 continue;
             }
             visible_chunks += 1;
-            for face in &mesh.faces {
+            for face in mesh.faces() {
                 if !face.is_visible_from(eye) {
                     continue;
                 }
-                let rect = atlas.uv(face.tile);
+                if face.layer == RenderLayer::Translucent {
+                    translucent.push(((face.center() - eye).length_squared(), *face));
+                    continue;
+                }
+                let rect = atlas.uv_id(face.texture);
                 let uvs = face.uv.map(|[u, v]| {
                     [
                         rect[0] + u * (rect[2] - rect[0]),
@@ -974,20 +1196,68 @@ impl MinecraftGame {
                     continue;
                 }
                 let distance = (face.center() - eye).length();
-                let fog = ((distance - FOG_START) / (FOG_END - FOG_START)).clamp(0.0, 1.0);
+                let fog = fog_amount(distance);
+                let cutoff = face.layer.cutout();
                 for index in 1..count - 1 {
-                    list.textured_triangle_3d(
+                    list.textured_triangle_3d_ex(
                         out[0],
                         out[index],
                         out[index + 1],
                         face.tint,
-                        SKY_HORIZON,
+                        fog_color(),
                         fog,
+                        1.0,
+                        cutoff,
+                        false,
+                        true,
                     );
                     triangles = triangles.saturating_add(1);
                 }
             }
         }
+
+        // Translucent faces are composited back-to-front across all visible
+        // chunks. They still depth-test against opaque geometry, but do not
+        // write depth, so overlapping water/glass does not punch holes.
+        translucent.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (distance_squared, face) in translucent {
+            let rect = atlas.uv_id(face.texture);
+            let uvs = face.uv.map(|[u, v]| {
+                [
+                    rect[0] + u * (rect[2] - rect[0]),
+                    rect[1] + v * (rect[3] - rect[1]),
+                ]
+            });
+            let count = camera.project_polygon_textured(
+                view_projection,
+                viewport,
+                &face.points,
+                &uvs,
+                &face.light,
+                &mut out,
+            );
+            if count < 3 {
+                continue;
+            }
+            let distance = distance_squared.sqrt();
+            let fog = fog_amount(distance);
+            for index in 1..count - 1 {
+                list.textured_triangle_3d_ex(
+                    out[0],
+                    out[index],
+                    out[index + 1],
+                    face.tint,
+                    fog_color(),
+                    fog,
+                    1.0,
+                    face.layer.cutout(),
+                    true,
+                    false,
+                );
+                triangles = triangles.saturating_add(1);
+            }
+        }
+
         self.triangles = triangles;
         self.visible_chunks = visible_chunks;
     }
@@ -1133,7 +1403,9 @@ impl Game for MinecraftGame {
         if (self.viewport - viewport).length_squared() > 0.01 {
             self.layout(viewport);
         }
-        list.set_atlas(Some(self.atlas.texture()));
+        // Textures decoded during meshing join the atlas before this frame.
+        self.textures.refresh();
+        list.set_atlas(Some(self.textures.texture()));
         self.draw_sky(list);
         if self.world.is_some() {
             self.draw_scene(list);
@@ -1560,5 +1832,173 @@ mod tests {
             game.world.as_ref().map(WorldState::kind),
             Some(WorldKind::Save)
         );
+    }
+
+    /// Writes the smallest vanilla-layout pack that models `minecraft:stone`
+    /// with its own 1x1 texture. Everything is authored here; no game asset is
+    /// involved.
+    fn write_fixture_pack(root: &Path) {
+        std::fs::create_dir_all(root.join("assets/minecraft/blockstates")).unwrap();
+        std::fs::create_dir_all(root.join("assets/minecraft/models/block")).unwrap();
+        std::fs::create_dir_all(root.join("assets/minecraft/textures/block")).unwrap();
+        std::fs::write(
+            root.join("pack.mcmeta"),
+            r#"{"pack":{"pack_format":34,"description":"RKB fixture pack"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("assets/minecraft/blockstates/stone.json"),
+            r#"{"variants":{"":{"model":"block/stone"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("assets/minecraft/models/block/stone.json"),
+            r##"{"parent":"block/cube_all","textures":{"all":"block/stone"}}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("assets/minecraft/models/block/cube_all.json"),
+            r##"{"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{
+                "north":{"texture":"#all"},"south":{"texture":"#all"},
+                "east":{"texture":"#all"},"west":{"texture":"#all"},
+                "up":{"texture":"#all"},"down":{"texture":"#all"}}}]}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("assets/minecraft/textures/block/stone.png"),
+            crate::pack::pack_png(&[10, 20, 30, 255], 1, 1),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resource_pack_replaces_the_builtin_atlas_and_can_be_cleared() {
+        let dir = TempDir::new("pack-client");
+        demo_world::write_flat_test_world(dir.path(), demo_world::DATA_VERSION).unwrap();
+        let root = dir.path().join("pack");
+        write_fixture_pack(&root);
+
+        let mut game = MinecraftGame::new(Some(dir.path().to_path_buf()));
+        assert!(game.has_world(), "{}", game.status());
+        assert!(
+            game.resource_pack_status()
+                .contains("built-in procedural atlas"),
+            "{}",
+            game.resource_pack_status()
+        );
+
+        let summary = game.load_resource_pack(&root).unwrap();
+        assert!(summary.contains("textures: pack"), "{summary}");
+        assert!(summary.contains("format 34"), "{summary}");
+        // The composed atlas is wider than the procedural one, so the draw
+        // list is now sampling pack pixels.
+        assert!(
+            game.textures.texture().width() > BlockAtlas::new().texture().width(),
+            "pack atlas must replace the procedural atlas"
+        );
+
+        // Every resident chunk is re-queued and re-meshed against the pack.
+        for _ in 0..60 {
+            game.update(context(1.0 / 60.0, Vec2::new(640.0, 360.0)));
+        }
+        assert!(game.stats().faces > 0);
+        assert_eq!(game.stats().missing_models, 0);
+        let status = game.resource_pack_status();
+        assert!(status.contains("2 textures"), "{status}");
+        assert!(status.contains("0 unmodelled"), "{status}");
+        assert!(status.contains("0 missing"), "{status}");
+
+        // A bad path is reported and leaves the loaded pack untouched.
+        let error = game
+            .load_resource_pack(&root.join("does-not-exist"))
+            .unwrap_err();
+        assert!(
+            error.contains("neither a directory nor a .zip archive"),
+            "{error}"
+        );
+        assert!(
+            game.resource_pack_status().contains("textures: pack"),
+            "{}",
+            game.resource_pack_status()
+        );
+
+        game.clear_resource_pack();
+        assert!(
+            game.resource_pack_status()
+                .contains("built-in procedural atlas"),
+            "{}",
+            game.resource_pack_status()
+        );
+        assert!(
+            !game.resource_pack_status().contains("textures: pack"),
+            "{}",
+            game.resource_pack_status()
+        );
+    }
+
+    #[test]
+    fn crosshair_is_centered_from_the_viewport() {
+        let dir = TempDir::new("crosshair");
+        demo_world::write_flat_test_world(dir.path(), demo_world::DATA_VERSION).unwrap();
+        let mut game = MinecraftGame::new(Some(dir.path().to_path_buf()));
+        for viewport in [Vec2::new(640.0, 360.0), Vec2::new(1234.0, 777.0)] {
+            let mut list = DrawList::new(SKY_HORIZON);
+            game.render(&mut list, viewport);
+            let center = viewport * 0.5;
+            let bar = |width: f32, height: f32| {
+                list.commands()
+                    .iter()
+                    .find_map(|command| match command {
+                        DrawCommand::Rect { rect, .. }
+                            if rect.width == width && rect.height == height =>
+                        {
+                            Some(*rect)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("no {width}x{height} crosshair bar"))
+            };
+            for rect in [bar(2.0, 16.0), bar(16.0, 2.0)] {
+                let actual = Vec2::new(rect.x + rect.width * 0.5, rect.y + rect.height * 0.5);
+                assert!(
+                    (actual - center).length_squared() < 0.01,
+                    "{viewport:?}: crosshair at {actual:?}, expected {center:?}"
+                );
+            }
+        }
+    }
+
+    /// Fog far edge must track the chunk load radius, and the ramp must run
+    /// from fully clear to fully fogged across it.
+    #[test]
+    fn fog_range_is_derived_from_the_chunk_load_radius() {
+        fn expected_fog_end(radius: i32) -> f32 {
+            (radius as f32 + 1.0) * 16.0
+        }
+        assert!(
+            (FOG_END - expected_fog_end(LOAD_RADIUS)).abs() < 0.001,
+            "FOG_END {FOG_END} must be one chunk ring past LOAD_RADIUS {LOAD_RADIUS}"
+        );
+        assert!(fog_amount(0.0).abs() < 0.0001);
+        assert!(fog_amount(FOG_START).abs() < 0.0001);
+        assert!((fog_amount(FOG_END) - 1.0).abs() < 0.0001);
+        assert!((fog_amount(FOG_END * 4.0) - 1.0).abs() < 0.0001);
+        let middle = fog_amount((FOG_START + FOG_END) * 0.5);
+        assert!(middle > 0.0 && middle < 1.0, "{middle}");
+        assert!(fog_amount(FOG_START - 1.0) < middle);
+        assert_eq!(fog_color(), SKY_HORIZON);
+    }
+
+    #[test]
+    fn field_of_view_is_clamped_like_the_vanilla_slider() {
+        let mut game = MinecraftGame::new(None);
+        assert!((game.fov_degrees() - 70.0).abs() < 0.01);
+        game.set_fov_degrees(45.0);
+        assert!((game.fov_degrees() - 45.0).abs() < 0.01);
+        assert!((game.camera().fov_y.to_degrees() - 45.0).abs() < 0.01);
+        game.set_fov_degrees(1000.0);
+        assert!((game.fov_degrees() - 110.0).abs() < 0.01);
+        game.set_fov_degrees(-5.0);
+        assert!((game.fov_degrees() - 30.0).abs() < 0.01);
     }
 }

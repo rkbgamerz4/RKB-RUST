@@ -121,7 +121,13 @@ pub enum DrawCommand {
     /// A depth-tested triangle sampling the draw list's texture atlas.
     ///
     /// The final pixel is `atlas(u, v) * tint * vertex_light`, blended towards
-    /// `fog_color` by `fog`. Texels with zero alpha are cut out.
+    /// `fog_color` by `fog`. `alpha` scales the texel alpha, `cutout` discards
+    /// pixels at or below that alpha (0 keeps only fully transparent texels
+    /// out), `blend` composites source-over into the framebuffer, and
+    /// `depth_write` controls whether the triangle updates the depth buffer.
+    /// Opaque geometry uses `alpha=1, cutout=0, blend=false, depth_write=true`;
+    /// cutout geometry raises `cutout`; translucent geometry sets `blend` and
+    /// usually clears `depth_write`.
     TexturedTriangle3D {
         a: Vertex3D,
         b: Vertex3D,
@@ -129,6 +135,10 @@ pub enum DrawCommand {
         tint: Color,
         fog_color: Color,
         fog: f32,
+        alpha: f32,
+        cutout: f32,
+        blend: bool,
+        depth_write: bool,
     },
     GradientTriangle {
         a: Vec2,
@@ -218,7 +228,7 @@ impl DrawList {
         self.push(DrawCommand::Triangle3D { a, b, c, color });
     }
 
-    /// Queues a depth-tested triangle textured from the current atlas.
+    /// Queues a depth-tested opaque triangle textured from the current atlas.
     pub fn textured_triangle_3d(
         &mut self,
         a: Vertex3D,
@@ -228,6 +238,24 @@ impl DrawList {
         fog_color: Color,
         fog: f32,
     ) {
+        self.textured_triangle_3d_ex(a, b, c, tint, fog_color, fog, 1.0, 0.0, false, true);
+    }
+
+    /// Queues a textured triangle with an explicit cutout/blend policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn textured_triangle_3d_ex(
+        &mut self,
+        a: Vertex3D,
+        b: Vertex3D,
+        c: Vertex3D,
+        tint: Color,
+        fog_color: Color,
+        fog: f32,
+        alpha: f32,
+        cutout: f32,
+        blend: bool,
+        depth_write: bool,
+    ) {
         self.push(DrawCommand::TexturedTriangle3D {
             a,
             b,
@@ -235,6 +263,10 @@ impl DrawList {
             tint,
             fog_color,
             fog: fog.clamp(0.0, 1.0),
+            alpha: alpha.clamp(0.0, 1.0),
+            cutout: cutout.clamp(0.0, 0.999),
+            blend,
+            depth_write,
         });
     }
 
@@ -373,6 +405,10 @@ impl RenderBackend for SoftwareBackend {
                     tint,
                     fog_color,
                     fog,
+                    alpha,
+                    cutout,
+                    blend,
+                    depth_write,
                 } => {
                     rasterize_textured_triangle(
                         framebuffer,
@@ -383,6 +419,10 @@ impl RenderBackend for SoftwareBackend {
                         tint,
                         fog_color,
                         fog,
+                        alpha,
+                        cutout,
+                        blend,
+                        depth_write,
                         list.atlas(),
                     );
                     stats.triangles += 1;
@@ -428,6 +468,10 @@ fn rasterize_triangle(
     tint: Color,
     fog_color: Color,
     fog: f32,
+    alpha: f32,
+    cutout: f32,
+    blend: bool,
+    depth_write: bool,
     atlas: Option<&Texture>,
 ) {
     let width = framebuffer.width() as i32;
@@ -479,7 +523,7 @@ fn rasterize_triangle(
                 continue;
             }
 
-            let (red, green, blue) = if let Some(atlas) = atlas {
+            let (red, green, blue, source_alpha) = if let Some(atlas) = atlas {
                 let inv = 1.0 / inv_w;
                 let u = (l0 * a.u * a.inv_w + l1 * b.u * b.inv_w + l2 * c.u * c.inv_w) * inv;
                 let v = (l0 * a.v * a.inv_w + l1 * b.v * b.inv_w + l2 * c.v * c.inv_w) * inv;
@@ -487,7 +531,8 @@ fn rasterize_triangle(
                     (l0 * a.light * a.inv_w + l1 * b.light * b.inv_w + l2 * c.light * c.inv_w)
                         * inv;
                 let texel = atlas.sample_nearest(u, v);
-                if texel.a == 0 {
+                let source_alpha = f32::from(texel.a) / 255.0 * alpha;
+                if source_alpha <= cutout {
                     continue;
                 }
                 let light = light.clamp(0.0, 1.5);
@@ -498,9 +543,19 @@ fn rasterize_triangle(
                     scale(texel.r, tint.r),
                     scale(texel.g, tint.g),
                     scale(texel.b, tint.b),
+                    source_alpha,
                 )
             } else {
-                (f32::from(tint.r), f32::from(tint.g), f32::from(tint.b))
+                let source_alpha = alpha;
+                if source_alpha <= cutout {
+                    continue;
+                }
+                (
+                    f32::from(tint.r),
+                    f32::from(tint.g),
+                    f32::from(tint.b),
+                    source_alpha,
+                )
             };
 
             let (red, green, blue) = if fog > 0.0 {
@@ -522,11 +577,29 @@ fn rasterize_triangle(
                 )
             };
 
-            depth[index] = inv_w;
+            if depth_write {
+                depth[index] = inv_w;
+            }
             let offset = index * 4;
-            pixels[offset] = red;
-            pixels[offset + 1] = green;
-            pixels[offset + 2] = blue;
+            if blend {
+                let inverse = 1.0 - source_alpha;
+                pixels[offset] = (f32::from(red) * source_alpha
+                    + f32::from(pixels[offset]) * inverse)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                pixels[offset + 1] = (f32::from(green) * source_alpha
+                    + f32::from(pixels[offset + 1]) * inverse)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                pixels[offset + 2] = (f32::from(blue) * source_alpha
+                    + f32::from(pixels[offset + 2]) * inverse)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            } else {
+                pixels[offset] = red;
+                pixels[offset + 1] = green;
+                pixels[offset + 2] = blue;
+            }
             pixels[offset + 3] = 255;
         }
     }
@@ -540,7 +613,21 @@ fn rasterize_depth_triangle(
     c: Vertex3D,
     color: Color,
 ) {
-    rasterize_triangle(framebuffer, depth, a, b, c, color, color, 0.0, None);
+    rasterize_triangle(
+        framebuffer,
+        depth,
+        a,
+        b,
+        c,
+        color,
+        color,
+        0.0,
+        1.0,
+        0.0,
+        false,
+        true,
+        None,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -553,10 +640,28 @@ fn rasterize_textured_triangle(
     tint: Color,
     fog_color: Color,
     fog: f32,
+    alpha: f32,
+    cutout: f32,
+    blend: bool,
+    depth_write: bool,
     atlas: Option<&Texture>,
 ) {
     // Without an attached atlas the flat tint keeps the command meaningful.
-    rasterize_triangle(framebuffer, depth, a, b, c, tint, fog_color, fog, atlas);
+    rasterize_triangle(
+        framebuffer,
+        depth,
+        a,
+        b,
+        c,
+        tint,
+        fog_color,
+        fog,
+        alpha,
+        cutout,
+        blend,
+        depth_write,
+        atlas,
+    );
 }
 
 /// A 2D camera that maps world coordinates to viewport pixels.
@@ -843,5 +948,108 @@ mod tests {
         let corner = project_clip(Vec3::new(-1.0, 1.0, 1.0), 1.0, viewport);
         assert_eq!((corner.x, corner.y), (0.0, 0.0));
         assert!((corner.depth - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn cutout_discards_transparent_texels() {
+        // Left texel is transparent, right texel is red.
+        let mut texels = Vec::new();
+        texels.extend_from_slice(&[0, 0, 0, 0]);
+        texels.extend_from_slice(&[255, 0, 0, 255]);
+        let atlas = Arc::new(Texture::from_rgba(2, 1, texels));
+        let mut backend = SoftwareBackend::new(16, 8);
+        let mut list = DrawList::new(Color::BLACK);
+        list.set_atlas(Some(atlas));
+        let a = Vertex3D::with_attributes(0.0, 0.0, 0.5, 1.0, 0.01, 0.5, 1.0);
+        let b = Vertex3D::with_attributes(16.0, 0.0, 0.5, 1.0, 0.99, 0.5, 1.0);
+        let c = Vertex3D::with_attributes(0.0, 8.0, 0.5, 1.0, 0.01, 0.5, 1.0);
+        list.textured_triangle_3d_ex(
+            a,
+            b,
+            c,
+            Color::WHITE,
+            Color::BLACK,
+            0.0,
+            1.0,
+            0.5,
+            false,
+            true,
+        );
+        backend.render(&list).unwrap();
+        assert_eq!(backend.framebuffer().pixel(1, 1), Some(Color::BLACK));
+        assert_eq!(
+            backend.framebuffer().pixel(12, 1),
+            Some(Color::rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn translucent_triangles_blend_source_over() {
+        let atlas = Arc::new(Texture::from_rgba(1, 1, vec![255, 255, 255, 255]));
+        let mut backend = SoftwareBackend::new(8, 8);
+        let mut list = DrawList::new(Color::rgb(0, 0, 255));
+        list.set_atlas(Some(atlas));
+        let a = Vertex3D::with_attributes(0.0, 0.0, 0.5, 1.0, 0.5, 0.5, 1.0);
+        let b = Vertex3D::with_attributes(8.0, 0.0, 0.5, 1.0, 0.5, 0.5, 1.0);
+        let c = Vertex3D::with_attributes(0.0, 8.0, 0.5, 1.0, 0.5, 0.5, 1.0);
+        list.textured_triangle_3d_ex(
+            a,
+            b,
+            c,
+            Color::WHITE,
+            Color::BLACK,
+            0.0,
+            0.5,
+            0.0,
+            true,
+            false,
+        );
+        backend.render(&list).unwrap();
+        let pixel = backend.framebuffer().pixel(1, 1).unwrap();
+        assert!((127..=128).contains(&pixel.r), "{pixel:?}");
+        assert!((127..=128).contains(&pixel.g), "{pixel:?}");
+        assert_eq!(pixel.b, 255, "{pixel:?}");
+    }
+
+    #[test]
+    fn translucent_triangles_do_not_write_depth() {
+        let atlas = Arc::new(Texture::from_rgba(1, 1, vec![255, 255, 255, 255]));
+        let mut backend = SoftwareBackend::new(8, 8);
+        let mut list = DrawList::new(Color::BLACK);
+        list.set_atlas(Some(atlas));
+        let near = || {
+            let a = Vertex3D::with_attributes(0.0, 0.0, 0.5, 0.25, 0.5, 0.5, 1.0);
+            let b = Vertex3D::with_attributes(8.0, 0.0, 0.5, 0.25, 0.5, 0.5, 1.0);
+            let c = Vertex3D::with_attributes(0.0, 8.0, 0.5, 0.25, 0.5, 0.5, 1.0);
+            (a, b, c)
+        };
+        // Opaque backdrop at mid depth.
+        let (a, b, c) = near();
+        let a = Vertex3D { inv_w: 0.2, ..a };
+        let b = Vertex3D { inv_w: 0.2, ..b };
+        let c = Vertex3D { inv_w: 0.2, ..c };
+        list.triangle_3d(a, b, c, Color::BLUE);
+        // Nearer translucent face that must not block the next opaque face.
+        let (a, b, c) = near();
+        list.textured_triangle_3d_ex(
+            a,
+            b,
+            c,
+            Color::GREEN,
+            Color::BLACK,
+            0.0,
+            1.0,
+            0.0,
+            true,
+            false,
+        );
+        // Opaque face between the translucent face and the backdrop.
+        let (a, b, c) = near();
+        let a = Vertex3D { inv_w: 0.3, ..a };
+        let b = Vertex3D { inv_w: 0.3, ..b };
+        let c = Vertex3D { inv_w: 0.3, ..c };
+        list.triangle_3d(a, b, c, Color::RED);
+        backend.render(&list).unwrap();
+        assert_eq!(backend.framebuffer().pixel(1, 1), Some(Color::RED));
     }
 }

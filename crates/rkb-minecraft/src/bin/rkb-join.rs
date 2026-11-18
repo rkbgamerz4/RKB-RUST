@@ -7,7 +7,8 @@
 //!
 //! Usage: `rkb-join --server <host[:port]> --block-report <blocks.json>
 //! [--name <name>] [--seconds <n>] [--out <frame.ppm>]
-//! [--width <px>] [--height <px>] [--hold <n>] [--query <x,y,z>]...`
+//! [--width <px>] [--height <px>] [--hold <n>] [--query <x,y,z>]...
+//! [--resource-pack <dir|zip>] [--fov <deg>] [--yaw <deg>] [--pitch <deg>]`
 
 use std::env;
 use std::fs::File;
@@ -49,6 +50,10 @@ struct Args {
     height: u32,
     hold: u64,
     queries: Vec<(i32, i32, i32)>,
+    resource_pack: Option<PathBuf>,
+    fov: Option<f32>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -61,9 +66,17 @@ fn parse_args() -> Result<Args, String> {
     let mut height = DEFAULT_HEIGHT;
     let mut hold = 0;
     let mut queries = Vec::new();
+    let mut resource_pack = None;
+    let mut fov = None;
+    let mut yaw = None;
+    let mut pitch = None;
     let mut args = env::args().skip(1);
     while let Some(argument) = args.next() {
         let mut value = |flag: &str| args.next().ok_or_else(|| format!("{flag} expects a value"));
+        let number = |flag: &str, raw: String| -> Result<f32, String> {
+            raw.parse()
+                .map_err(|_| format!("{flag} expects a number, got {raw:?}"))
+        };
         match argument.as_str() {
             "--server" => server = Some(value("--server")?),
             "--block-report" => block_report = Some(PathBuf::from(value("--block-report")?)),
@@ -89,6 +102,21 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--hold expects seconds".to_owned())?;
             }
+            "--resource-pack" => {
+                resource_pack = Some(PathBuf::from(value("--resource-pack")?));
+            }
+            "--fov" => {
+                let raw = value("--fov")?;
+                fov = Some(number("--fov", raw)?);
+            }
+            "--yaw" => {
+                let raw = value("--yaw")?;
+                yaw = Some(number("--yaw", raw)?);
+            }
+            "--pitch" => {
+                let raw = value("--pitch")?;
+                pitch = Some(number("--pitch", raw)?);
+            }
             "--query" => {
                 let raw = value("--query")?;
                 let parts: Vec<i32> = raw
@@ -107,7 +135,9 @@ fn parse_args() -> Result<Args, String> {
                 println!(
                     "usage: rkb-join --server <host[:port]> --block-report <blocks.json> \
                      [--name <name>] [--seconds <n>] [--out <frame.ppm>] \
-                     [--width <px>] [--height <px>]"
+                     [--width <px>] [--height <px>] [--hold <n>] [--query <x,y,z>]... \
+                     [--resource-pack <dir|zip>] [--fov <deg>] [--yaw <deg>] \
+                     [--pitch <deg>]"
                 );
                 std::process::exit(0);
             }
@@ -116,6 +146,11 @@ fn parse_args() -> Result<Args, String> {
     }
     if seconds == 0 || width == 0 || height == 0 {
         return Err("--seconds, --width, and --height must be positive".to_owned());
+    }
+    if let Some(pitch) = pitch {
+        if !(-90.0..=90.0).contains(&pitch) {
+            return Err("--pitch must be within -90..90 degrees".to_owned());
+        }
     }
     Ok(Args {
         server: server.ok_or("--server is required")?,
@@ -128,6 +163,10 @@ fn parse_args() -> Result<Args, String> {
         height,
         hold,
         queries,
+        resource_pack,
+        fov,
+        yaw,
+        pitch,
     })
 }
 
@@ -155,12 +194,41 @@ fn run() -> Result<(), String> {
             ))
     );
 
-    let game = MinecraftGame::join_server(server);
+    let mut game = MinecraftGame::join_server(server);
     println!(
         "world: {} | {}",
         game.world_kind().unwrap_or("none"),
         game.status()
     );
+
+    match &args.resource_pack {
+        Some(path) => {
+            let summary = game
+                .load_resource_pack(path)
+                .map_err(|error| format!("resource pack {}: {error}", path.display()))?;
+            println!("resource pack: {summary}");
+        }
+        None => println!("resource pack: {}", game.resource_pack_status()),
+    }
+    if let Some(fov) = args.fov {
+        game.set_fov_degrees(fov);
+    }
+    if let Some(yaw) = args.yaw {
+        let pitch = game.player().pitch;
+        game.set_look(yaw.to_radians(), pitch);
+    }
+    if let Some(pitch) = args.pitch {
+        let yaw = game.player().yaw;
+        game.set_look(yaw, pitch.to_radians());
+    }
+    if args.fov.is_some() || args.yaw.is_some() || args.pitch.is_some() {
+        println!(
+            "camera: fov {:.1}°, yaw {:.1}°, pitch {:.1}°",
+            game.fov_degrees(),
+            game.player().yaw.to_degrees(),
+            game.player().pitch.to_degrees()
+        );
+    }
 
     let mut runtime = Runtime::new(
         RuntimeConfig {
@@ -216,6 +284,20 @@ fn run() -> Result<(), String> {
         stats.yaw,
         stats.pitch,
         runtime.game().save_status()
+    );
+    println!("{}", runtime.game().light_status());
+    println!("{}", runtime.game().resource_pack_status());
+    println!(
+        "mesh: {} blocks with fallback shapes, {} translucent faces, light fallback {}",
+        stats.missing_models, stats.translucent_faces, stats.light_fallback
+    );
+    println!(
+        "server delivery: {} chunk columns, {} unloaded, {} resets, {} block updates | status: {}",
+        stats.chunks_received,
+        stats.unloads,
+        stats.resets,
+        stats.block_updates,
+        runtime.game().status()
     );
     if let Some(reason) = runtime.game().status().strip_prefix("Disconnected: ") {
         println!("server disconnected: {reason}");
