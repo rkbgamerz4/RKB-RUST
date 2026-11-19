@@ -1,0 +1,30 @@
+[package]
+name = "rkb-gpu"
+description = "wgpu rendering backend for RKB RUST (Vulkan first, GLES fallback)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rkb-join-gpu"
+path = "src/bin/rkb-join-gpu.rs"
+
+[dependencies]
+rkb-core = { workspace = true }
+rkb-mc = { workspace = true }
+rkb-minecraft = { workspace = true }
+rkb-net = { workspace = true }
+rkb-render = { workspace = true }
+rkb-runtime = { workspace = true }
+wgpu = "0.19.4"
+pollster = "0.3"
+bytemuck = { version = "1.16", features = ["derive"] }
+
+[dev-dependencies]
+naga = { version = "0.19", features = ["wgsl-in"] }
+
+[lints]
+workspace = true
