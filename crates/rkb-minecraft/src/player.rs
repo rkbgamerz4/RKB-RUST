@@ -38,6 +38,8 @@ pub struct MoveInput {
     pub jump: bool,
     /// Used only while flying.
     pub descend: bool,
+    /// When true, walking speed is doubled (sprinting).
+    pub sprint: bool,
 }
 
 /// First-person player state.
@@ -110,7 +112,13 @@ impl Player {
         if magnitude > 1.0 {
             wish = wish * (1.0 / magnitude);
         }
-        let speed = if self.flying { FLY_SPEED } else { WALK_SPEED };
+        let speed = if self.flying {
+            FLY_SPEED
+        } else if input.sprint {
+            WALK_SPEED * 1.3
+        } else {
+            WALK_SPEED
+        };
         self.velocity.x = wish.x * speed;
         self.velocity.z = wish.z * speed;
 

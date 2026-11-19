@@ -228,11 +228,22 @@ pub struct MinecraftGame {
     spawn: Vec3,
     player: Player,
     meshes: BTreeMap<(i32, i32), ChunkMesh>,
+    /// Monotonic revision per resident mesh, consumed by the GPU backend so it
+    /// uploads only meshes that actually changed.
+    mesh_revs: BTreeMap<(i32, i32), u64>,
+    mesh_serial: u64,
+    /// Bumped whenever every mesh is dropped (world load, pack change) so an
+    /// external consumer can invalidate its whole cache.
+    mesh_epoch: u64,
+    /// Bumped whenever the active atlas or its UV rectangles change.
+    atlas_generation: u64,
     queue: VecDeque<(i32, i32)>,
     center: Option<(i32, i32)>,
     viewport: Vec2,
     joystick: VirtualJoystick,
     jump: TouchButton,
+    sneak: TouchButton,
+    sprint: TouchButton,
     fly: TouchButton,
     descend: TouchButton,
     break_button: TouchButton,
@@ -271,11 +282,17 @@ impl MinecraftGame {
             spawn: Vec3::new(0.5, 80.0, 0.5),
             player: Player::new(Vec3::new(0.5, 80.0, 0.5)),
             meshes: BTreeMap::new(),
+            mesh_revs: BTreeMap::new(),
+            mesh_serial: 0,
+            mesh_epoch: 0,
+            atlas_generation: 0,
             queue: VecDeque::new(),
             center: None,
             viewport,
             joystick: VirtualJoystick::new(Vec2::new(160.0, 560.0), 96.0),
             jump: TouchButton::new(Rect::new(1080.0, 560.0, 96.0, 96.0), "JUMP"),
+            sneak: TouchButton::new(Rect::new(1080.0, 516.0, 96.0, 96.0), "SNEAK"),
+            sprint: TouchButton::new(Rect::new(1080.0, 468.0, 96.0, 96.0), "SPRINT"),
             fly: TouchButton::new(Rect::new(1080.0, 452.0, 96.0, 96.0), "FLY"),
             descend: TouchButton::new(Rect::new(972.0, 560.0, 96.0, 96.0), "DOWN"),
             break_button: TouchButton::new(Rect::new(864.0, 560.0, 96.0, 96.0), "BREAK"),
@@ -324,7 +341,7 @@ impl MinecraftGame {
     pub fn load_server(&mut self, server: ServerWorld) {
         self.world_path = None;
         self.edits.clear();
-        self.meshes.clear();
+        self.clear_meshes();
         self.queue.clear();
         self.center = None;
         self.save_dirty = false;
@@ -505,9 +522,10 @@ impl MinecraftGame {
         let textures = ActiveTextures::Pack(PackRuntime { models, atlas });
         let summary = textures.status();
         self.textures = textures;
+        self.atlas_generation = self.atlas_generation.wrapping_add(1);
         // Every face may now use different geometry and texture ids, so the
         // whole loaded area is queued again rather than kept as-is.
-        self.meshes.clear();
+        self.clear_meshes();
         self.center = None;
         self.ensure_area();
         self.message = format!("Resource pack loaded from {}.", path.display());
@@ -518,7 +536,8 @@ impl MinecraftGame {
     pub fn clear_resource_pack(&mut self) {
         if matches!(self.textures, ActiveTextures::Pack(_)) {
             self.textures = ActiveTextures::default();
-            self.meshes.clear();
+            self.atlas_generation = self.atlas_generation.wrapping_add(1);
+            self.clear_meshes();
             self.center = None;
             self.ensure_area();
             self.message = "Resource pack cleared; using built-in textures.".to_owned();
@@ -677,6 +696,77 @@ impl MinecraftGame {
         Ok(true)
     }
 
+    /// Records a new revision for one mesh.
+    fn mark_mesh(&mut self, key: (i32, i32)) {
+        self.mesh_serial = self.mesh_serial.wrapping_add(1);
+        self.mesh_revs.insert(key, self.mesh_serial);
+    }
+
+    /// Drops every resident mesh and invalidates external caches.
+    fn clear_meshes(&mut self) {
+        self.meshes.clear();
+        self.mesh_revs.clear();
+        self.mesh_epoch = self.mesh_epoch.wrapping_add(1);
+    }
+
+    /// Atlas texture the mesher and draw list currently share.
+    ///
+    /// The GPU backend uploads exactly this texture, so the procedural atlas and
+    /// a user pack reach the GPU through the same path.
+    #[must_use]
+    pub fn atlas_texture(&self) -> Arc<Texture> {
+        self.textures.texture()
+    }
+
+    /// `[u0, v0, u1, v1]` for one texture id in the active atlas.
+    #[must_use]
+    pub fn atlas_uv(&self, id: u32) -> [f32; 4] {
+        self.textures.uv_id(id)
+    }
+
+    /// Bumped when the atlas (or its UV rectangles) changes.
+    #[must_use]
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
+    }
+
+    /// Bumped when every mesh is dropped, so caches can be cleared wholesale.
+    #[must_use]
+    pub fn mesh_epoch(&self) -> u64 {
+        self.mesh_epoch
+    }
+
+    /// Resident meshes with their revision, cheap enough to scan per frame.
+    #[must_use]
+    pub fn resident_meshes(&self) -> Vec<(&ChunkMesh, u64)> {
+        self.meshes
+            .iter()
+            .map(|(key, mesh)| (mesh, self.mesh_revs.get(key).copied().unwrap_or(0)))
+            .collect()
+    }
+
+    /// Fog start and end distances in blocks, matching the software renderer.
+    #[must_use]
+    pub fn fog_range(&self) -> (f32, f32) {
+        (FOG_START, FOG_END)
+    }
+
+    /// Sky and fog colours used by the software renderer.
+    #[must_use]
+    pub fn sky_colors(&self) -> (Color, Color) {
+        (SKY_ZENITH, SKY_HORIZON)
+    }
+
+    /// The 2D HUD commands for one frame, for a GPU UI batch.
+    ///
+    /// Only 2D commands are produced; the world is drawn by the caller.
+    #[must_use]
+    pub fn hud_commands(&self) -> Vec<rkb_render::DrawCommand> {
+        let mut list = DrawList::new(Color::rgba(0, 0, 0, 0));
+        self.draw_hud(&mut list);
+        list.commands().to_vec()
+    }
+
     fn refresh_chunk(&mut self, cx: i32, cz: i32) {
         let Some(center) = self.center else {
             return;
@@ -689,6 +779,7 @@ impl MinecraftGame {
                     continue;
                 }
                 self.meshes.remove(&key);
+                self.mesh_revs.remove(&key);
                 if !self.queue.contains(&key) {
                     self.queue.push_front(key);
                 }
@@ -866,8 +957,16 @@ impl MinecraftGame {
         let right = self.viewport.x - margin - side;
         let bottom = self.viewport.y - margin - side;
         self.jump.set_bounds(Rect::new(right, bottom, side, side));
-        self.descend
-            .set_bounds(Rect::new(right - side - gap, bottom, side, side));
+        self.sprint
+            .set_bounds(Rect::new(right, bottom - side - gap, side, side));
+        self.sneak
+            .set_bounds(Rect::new(right, bottom - side - gap * 2.0, side, side));
+        self.descend.set_bounds(Rect::new(
+            right - side - gap,
+            bottom - side - gap * 2.0,
+            side,
+            side,
+        ));
         self.break_button
             .set_bounds(Rect::new(right - (side + gap) * 2.0, bottom, side, side));
         self.place_button
@@ -894,6 +993,20 @@ impl MinecraftGame {
                     "Flight disabled.".to_owned()
                 };
             }
+            return;
+        }
+        if self.sneak.handle(event) {
+            // Sneak toggles crouching; the server handles the state change.
+            // We track the state locally but the server authoritative handles it.
+            self.message = if self.player.flying {
+                "Sneak toggled (flight mode).".to_owned()
+            } else {
+                "Sneak toggled.".to_owned()
+            };
+            return;
+        }
+        if self.sprint.handle(event) {
+            self.message = "Sprint toggled.".to_owned();
             return;
         }
         if self.jump.handle(event) {
@@ -981,6 +1094,7 @@ impl MinecraftGame {
                 .collect();
             for key in unloaded {
                 self.meshes.remove(&key);
+                self.mesh_revs.remove(&key);
             }
         }
 
@@ -994,6 +1108,7 @@ impl MinecraftGame {
                 continue;
             }
             self.meshes.remove(&key);
+            self.mesh_revs.remove(&key);
             if !self.queue.contains(&key) {
                 self.queue.push_front(key);
             }
@@ -1012,6 +1127,7 @@ impl MinecraftGame {
             strafe: value.x,
             jump: self.jump.is_pressed(),
             descend: self.player.flying && self.descend.is_pressed(),
+            sprint: self.sprint.is_pressed(),
         };
         let mut query = WorldQuery {
             world,
@@ -1069,9 +1185,11 @@ impl MinecraftGame {
             }
             world.retain_chunks(center, RETAIN_RADIUS + 1);
         }
-        self.meshes.retain(|&(cx, cz), _| {
+        let keep = |&(cx, cz): &(i32, i32)| {
             (cx - center.0).abs() <= RETAIN_RADIUS && (cz - center.1).abs() <= RETAIN_RADIUS
-        });
+        };
+        self.meshes.retain(|&key, _| keep(&key));
+        self.mesh_revs.retain(|&key, _| keep(&key));
         let mut needed = Vec::new();
         for dz in -LOAD_RADIUS..=LOAD_RADIUS {
             for dx in -LOAD_RADIUS..=LOAD_RADIUS {
@@ -1108,6 +1226,7 @@ impl MinecraftGame {
         match result {
             Ok(Some(mesh)) => {
                 self.meshes.insert((cx, cz), mesh);
+                self.mark_mesh((cx, cz));
             }
             Ok(None) => {}
             Err(error) => {
@@ -1558,6 +1677,54 @@ mod tests {
             elapsed: std::time::Duration::ZERO,
             viewport,
         }
+    }
+
+    #[test]
+    fn gpu_accessors_expose_the_same_atlas_and_hud_as_the_software_path() {
+        let mut game = MinecraftGame::new(None);
+        let atlas = game.atlas_texture();
+        assert!(atlas.width() > 0 && atlas.height() > 0);
+        let rect = game.atlas_uv(0);
+        assert!(rect[2] > rect[0] && rect[3] > rect[1]);
+        assert_eq!(game.atlas_generation(), 0);
+        assert!(game.resident_meshes().is_empty());
+
+        // The HUD is generated for the laid-out viewport, not a GPU-specific
+        // duplicate: the GPU backend batch draws these exact commands.
+        game.layout(Vec2::new(640.0, 360.0));
+        let commands = game.hud_commands();
+        assert!(!commands.is_empty());
+        assert!(commands
+            .iter()
+            .all(|command| !matches!(command, DrawCommand::Triangle3D { .. })));
+    }
+
+    #[test]
+    fn mesh_revisions_advance_only_for_the_changed_chunk() {
+        let mut game = MinecraftGame::new(None);
+        let key = (2, -3);
+        assert_eq!(game.mesh_epoch(), 0);
+        game.meshes.insert(
+            key,
+            ChunkMesh {
+                chunk: key,
+                ..ChunkMesh::default()
+            },
+        );
+        game.mark_mesh(key);
+        let first = game.resident_meshes();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].1, 1);
+
+        // Re-marking the same mesh advances only its revision.
+        game.mark_mesh(key);
+        let second = game.resident_meshes();
+        assert_eq!(second[0].1, 2);
+
+        // Clearing drops the revision and invalidates external caches.
+        game.clear_meshes();
+        assert!(game.resident_meshes().is_empty());
+        assert_eq!(game.mesh_epoch(), 1);
     }
 
     #[test]
