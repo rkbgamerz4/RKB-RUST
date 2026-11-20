@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use rkb_core::{Stage, Vec2};
+use rkb_gpu::{BackendInfo, Fog, FrameStats, GpuContext, SceneSync, SurfaceRenderer, SyncTiming};
 use rkb_input::{TouchEvent, TouchPhase, TouchPoint};
 use rkb_mc::BlockRegistry;
 use rkb_minecraft::MinecraftGame;
@@ -21,6 +22,57 @@ pub enum EngineFrame {
     Presented(FrameReport),
     Skipped,
     Failed(String),
+}
+
+/// Chunk meshes uploaded per frame on the GPU path, matching the client's
+/// meshing budget so uploads stay bounded.
+const GPU_UPLOAD_BUDGET: usize = 2;
+
+/// Everything owned by the GPU presentation path.
+///
+/// Dropped as one unit on detach: the swapchain and its `ANativeWindow` must
+/// not outlive the window, so [`AndroidEngine::detach_gpu`] returns the raw
+/// window pointer *after* this value is dropped for the caller to release.
+#[derive(Debug)]
+pub struct GpuState {
+    renderer: SurfaceRenderer,
+    sync: SceneSync,
+    /// Raw `ANativeWindow*` borrowed from the Java `Surface`.
+    window: usize,
+    width: u32,
+    height: u32,
+    info: BackendInfo,
+    last_stats: FrameStats,
+    frames: u64,
+    frame_nanos: u128,
+    upload_nanos: u128,
+    upload_count: u64,
+    uploaded_bytes: u64,
+    init_nanos: u128,
+}
+
+impl GpuState {
+    /// Diagnostic line: adapter identity plus cumulative upload counters.
+    fn status(&self) -> String {
+        format!(
+            "{} | adapter={} | init_ms={:.1} frames={} gpu_ms/frame={:.2} uploads={} upload_bytes={} gpu_buffers={} chunks={} draws={} tris={}",
+            self.info.detail(),
+            self.info.class().label(),
+            self.init_nanos as f64 / 1_000_000.0,
+            self.frames,
+            if self.frames > 0 {
+                self.frame_nanos as f64 / 1_000_000.0 / self.frames as f64
+            } else {
+                0.0
+            },
+            self.upload_count,
+            self.uploaded_bytes,
+            self.renderer.scene().gpu_bytes(),
+            self.renderer.scene().chunk_count(),
+            self.last_stats.draw_calls,
+            self.last_stats.triangles,
+        )
+    }
 }
 
 /// Surface that presents directly into a Kotlin-owned direct ByteBuffer.
@@ -78,6 +130,10 @@ pub struct AndroidEngine {
     join_status: Option<String>,
     /// Pack to apply once the join completes, opened off the network thread.
     join_resource_pack: Option<PathBuf>,
+    /// Present when a native surface is attached and the GPU initialized.
+    gpu: Option<GpuState>,
+    /// Exact GPU initialization or frame failure, reported verbatim.
+    gpu_error: Option<String>,
 }
 
 impl AndroidEngine {
@@ -103,6 +159,8 @@ impl AndroidEngine {
             join: None,
             join_status: None,
             join_resource_pack: None,
+            gpu: None,
+            gpu_error: None,
         }
     }
 
@@ -250,6 +308,203 @@ impl AndroidEngine {
         }
     }
 
+    /// Attaches a native window and initializes the GPU renderer.
+    ///
+    /// `window` is the raw `ANativeWindow` handle built by the JNI layer from
+    /// the Java `Surface`; the caller keeps that window alive until
+    /// [`Self::detach_gpu`] returns. On success the returned string is the
+    /// adapter summary (for logs and the overlay); on failure the exact reason
+    /// is stored and reported by [`Self::renderer_status`].
+    pub fn attach_gpu(
+        &mut self,
+        window: rkb_gpu::rwh::RawWindowHandle,
+        window_ptr: usize,
+        width: u32,
+        height: u32,
+    ) -> Result<String, String> {
+        if self.destroyed {
+            return Err("engine already destroyed".to_owned());
+        }
+        // Replacing a surface must drop the old swapchain first.
+        drop(self.gpu.take());
+        let width = width.max(1);
+        let height = height.max(1);
+        let started = std::time::Instant::now();
+
+        let outcome = (|| -> Result<(SurfaceRenderer, BackendInfo), String> {
+            let instance = rkb_gpu::create_instance(rkb_gpu::default_backends());
+            let display =
+                rkb_gpu::rwh::RawDisplayHandle::Android(rkb_gpu::rwh::AndroidDisplayHandle::new());
+            let surface = rkb_gpu::create_surface(&instance, window, display)
+                .map_err(|error| error.to_string())?;
+            let context = GpuContext::from_instance(instance, Some(&surface))
+                .map_err(|error| error.to_string())?;
+            let atlas = self.runtime.game().atlas_texture();
+            let renderer = SurfaceRenderer::new(&context, surface, width, height, &atlas)
+                .map_err(|error| error.to_string())?;
+            Ok((renderer, context.info))
+        })();
+
+        match outcome {
+            Ok((renderer, info)) => {
+                let summary = info.summary();
+                let format = renderer.format();
+                self.gpu_error = None;
+                // The HUD, touch, and fog layout must match the swapchain, not
+                // the bitmap path's scaled buffer.
+                self.runtime.resize(width, height);
+                self.gpu = Some(GpuState {
+                    renderer,
+                    sync: SceneSync::new(GPU_UPLOAD_BUDGET),
+                    window: window_ptr,
+                    width,
+                    height,
+                    info: info.clone(),
+                    last_stats: FrameStats::default(),
+                    frames: 0,
+                    frame_nanos: 0,
+                    upload_nanos: 0,
+                    upload_count: 0,
+                    uploaded_bytes: 0,
+                    init_nanos: started.elapsed().as_nanos(),
+                });
+                Ok(format!(
+                    "{summary} | init {:.1} ms | {:?} {}x{}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    format,
+                    width,
+                    height
+                ))
+            }
+            Err(error) => {
+                let detail = format!("gpu init failed: {error}");
+                self.gpu_error = Some(detail.clone());
+                Err(detail)
+            }
+        }
+    }
+
+    /// Detaches the GPU renderer and returns the raw window to release.
+    ///
+    /// The surface and swapchain are dropped before the pointer is handed back,
+    /// so the caller can release its `ANativeWindow` reference safely.
+    pub fn detach_gpu(&mut self) -> Option<usize> {
+        let state = self.gpu.take()?;
+        let window = state.window;
+        drop(state);
+        Some(window)
+    }
+
+    /// True while a native surface is attached to the GPU renderer.
+    #[must_use]
+    pub fn gpu_attached(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// The active renderer and, if the GPU failed, the exact reason.
+    #[must_use]
+    pub fn renderer_status(&self) -> String {
+        match (&self.gpu, &self.gpu_error) {
+            (Some(state), _) => format!("renderer=gpu {}", state.status()),
+            (None, Some(error)) => format!("renderer=software ({error})"),
+            (None, None) => "renderer=software (gpu not initialized)".to_owned(),
+        }
+    }
+
+    /// Adapter summary of the current GPU, if one is attached.
+    #[must_use]
+    pub fn gpu_adapter(&self) -> Option<&BackendInfo> {
+        self.gpu.as_ref().map(|state| &state.info)
+    }
+
+    /// Advances the game and renders one frame into the native swapchain.
+    ///
+    /// Networking and pack work stay where M5/M6 put them: `poll_join` only
+    /// checks a channel, and mesh upload is bounded by [`GPU_UPLOAD_BUDGET`].
+    pub fn frame_gpu(&mut self, width: u32, height: u32, delta: Duration) -> EngineFrame {
+        if self.destroyed {
+            return EngineFrame::Failed("engine already destroyed".to_owned());
+        }
+        let width = width.max(1);
+        let height = height.max(1);
+        self.poll_join();
+
+        let attached = self.gpu.is_some();
+        if !attached {
+            return EngineFrame::Failed(
+                self.gpu_error
+                    .clone()
+                    .unwrap_or_else(|| "gpu surface not attached".to_owned()),
+            );
+        }
+
+        // Rotation and surface recreation resize the swapchain before drawing.
+        let resized = self
+            .gpu
+            .as_ref()
+            .is_some_and(|state| state.width != width || state.height != height);
+        if resized {
+            if let Some(state) = self.gpu.as_mut() {
+                state.width = width;
+                state.height = height;
+                state.renderer.resize(width, height);
+            }
+            self.runtime.resize(width, height);
+        }
+
+        let report = match self.runtime.advance(delta) {
+            Ok(report) => report,
+            Err(error) => return EngineFrame::Failed(error.to_string()),
+        };
+        if !report.ran {
+            return EngineFrame::Skipped;
+        }
+
+        let Some(state) = self.gpu.as_mut() else {
+            return EngineFrame::Failed("gpu surface detached mid-frame".to_owned());
+        };
+        let game = self.runtime.game();
+        let timing = match SyncTiming::measure(&mut state.sync, state.renderer.scene_mut(), game) {
+            Ok(timing) => timing,
+            Err(error) => {
+                let detail = format!("gpu upload failed: {error}");
+                self.gpu_error = Some(detail.clone());
+                return EngineFrame::Failed(detail);
+            }
+        };
+        state.upload_nanos += u128::from(timing.nanos);
+        state.upload_count += timing.stats.uploaded as u64;
+        state.uploaded_bytes += timing.stats.uploaded_bytes;
+
+        let camera = game.camera();
+        let (fog_start, fog_end) = game.fog_range();
+        let (sky_top, fog_color) = game.sky_colors();
+        let ui = game.hud_commands();
+        let frame_started = std::time::Instant::now();
+        let rendered = state
+            .renderer
+            .render(
+                &camera,
+                Fog::new(fog_start, fog_end, fog_color),
+                sky_top,
+                &ui,
+            )
+            .map_err(|error| error.to_string());
+        match rendered {
+            Ok(stats) => {
+                state.last_stats = stats;
+                state.frames += 1;
+                state.frame_nanos += frame_started.elapsed().as_nanos();
+                EngineFrame::Presented(report)
+            }
+            Err(error) => {
+                let detail = format!("gpu frame failed: {error}");
+                self.gpu_error = Some(detail.clone());
+                EngineFrame::Failed(detail)
+            }
+        }
+    }
+
     pub fn pause(&mut self) -> Result<Stage, String> {
         self.runtime.pause().map_err(|error| error.to_string())
     }
@@ -271,7 +526,7 @@ impl AndroidEngine {
         let stats = game.stats();
         let report = self.runtime.last_report();
         format!(
-            "stage={:?} frames={} fps={:.1} world={} kind={} chunks={}/{} visible={} faces={} tris={} blocks={} edits={} pos=({:.1},{:.1},{:.1}) yaw={:.0} pitch={:.0} fly={} save={} join={} status={} pack={}",
+            "stage={:?} frames={} fps={:.1} world={} kind={} chunks={}/{} visible={} faces={} tris={} blocks={} edits={} pos=({:.1},{:.1},{:.1}) yaw={:.0} pitch={:.0} fly={} save={} join={} status={} pack={} {}",
             self.runtime.stage(),
             report.frame_index,
             report.fps,
@@ -293,7 +548,10 @@ impl AndroidEngine {
             game.save_status(),
             self.join_status.as_deref().unwrap_or("idle"),
             game.status(),
-            game.resource_pack_status()
+            game.resource_pack_status(),
+            // Active backend: "renderer=gpu wgpu / Vulkan / llvmpipe …
+            // software renderer" or "renderer=software (<exact GPU error>)".
+            self.renderer_status()
         )
     }
 

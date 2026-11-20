@@ -2,7 +2,7 @@ name: Android ARM64
 
 on:
   push:
-    branches: [feature/rkb-rust-foundation]
+    branches: [feature/rkb-rust-foundation, feature/mc-java-protocol]
   pull_request:
     paths:
       - "android/**"

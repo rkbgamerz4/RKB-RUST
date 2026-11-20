@@ -297,6 +297,53 @@ impl<G: Game> Runtime<G> {
         Ok(self.last_report)
     }
 
+    /// Advances the simulation without rasterizing.
+    ///
+    /// The GPU backend presents its own swapchain images, so running the
+    /// software rasterizer here would only burn CPU on a framebuffer nobody
+    /// shows. The returned report carries frame timing but no software
+    /// [`RenderStats`]; a GPU host reports its own draw counters instead.
+    pub fn advance(&mut self, delta: Duration) -> Result<FrameReport, RuntimeError> {
+        if !self.lifecycle.stage().can_render() {
+            self.last_report.ran = false;
+            return Ok(self.last_report);
+        }
+
+        let max_delta = Duration::from_millis(u64::from(self.config.engine.max_delta_ms));
+        let clamped_delta = delta.min(max_delta);
+        let steps = self.timestep.advance(clamped_delta);
+        let step_duration = self.timestep.step();
+        let step_seconds = step_duration.as_secs_f32();
+
+        for step in 0..steps.steps {
+            self.simulation_time += step_duration;
+            self.game.update(UpdateContext {
+                frame: self.frame_index,
+                step,
+                dt: step_seconds,
+                elapsed: self.simulation_time,
+                viewport: self.viewport,
+            });
+        }
+
+        self.elapsed_time += clamped_delta;
+        self.rate.tick(clamped_delta);
+        self.frame_index += 1;
+
+        self.last_report = FrameReport {
+            ran: true,
+            frame_index: self.frame_index,
+            steps: steps.steps,
+            dropped_steps: steps.dropped_steps,
+            alpha: steps.alpha(),
+            fps: self.rate.fps(),
+            elapsed: self.elapsed_time,
+            render: RenderStats::default(),
+            checksum: 0,
+        };
+        Ok(self.last_report)
+    }
+
     /// Renders without presenting, for embedding backends such as Android.
     pub fn render_only(&mut self) -> Result<FrameReport, RuntimeError> {
         if !self.lifecycle.stage().can_render() {
@@ -373,6 +420,30 @@ mod tests {
         assert!(!report.ran);
         assert_eq!(runtime.game().updates, 0);
         assert_eq!(surface.frames_presented(), 0);
+    }
+
+    #[test]
+    fn advance_updates_without_rasterizing_for_the_gpu_path() {
+        let mut runtime = runtime();
+        runtime.start().unwrap();
+        let report = runtime.advance(Duration::from_millis(32)).unwrap();
+        assert!(report.ran);
+        assert!(runtime.game().updates > 0, "simulation must still advance");
+        assert_eq!(
+            runtime.game().renders,
+            0,
+            "the GPU path must not spend CPU on the software rasterizer"
+        );
+        assert_eq!(report.checksum, 0);
+        assert!(report.fps > 0.0 || report.elapsed > Duration::ZERO);
+
+        // Paused hosts still skip frames exactly like the software path.
+        runtime.pause().unwrap();
+        let skipped = runtime.advance(Duration::from_millis(16)).unwrap();
+        assert!(!skipped.ran);
+        let updates = runtime.game().updates;
+        runtime.advance(Duration::from_millis(16)).unwrap();
+        assert_eq!(runtime.game().updates, updates);
     }
 
     #[test]

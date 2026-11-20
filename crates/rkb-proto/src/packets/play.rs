@@ -963,6 +963,105 @@ impl BlockChange {
     }
 }
 
+/// Clientbound `SectionBlocksUpdate` (multi block change).
+///
+/// One packet carries every changed block of a single 16³ section. The body
+/// is a packed section coordinate written as one big-endian `i64` (`x` in the
+/// top 22 bits, `z` in the next 22, `y` in the low 20), a VarInt record
+/// count, then one VarInt per record: the new state id in the high bits and
+/// the section-relative position (`local x` 4, `local z` 4, `local y` 4) in
+/// the low 12. The layout was verified against captured 1.21.1 packets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionBlocksUpdate {
+    /// The changed blocks with absolute positions, in wire order.
+    pub changes: Vec<BlockChange>,
+}
+
+impl SectionBlocksUpdate {
+    /// Largest number of records one section can hold (16³).
+    pub const MAX_RECORDS: usize = 4096;
+    /// Largest state id one record can carry (the low 12 bits hold the
+    /// position, and a record must stay a non-negative `i32`).
+    pub const MAX_STATE_ID: i32 = 524_287;
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(payload);
+        let section = reader.read_i64()?;
+        let count = reader.read_varint()?;
+        if !(0..=Self::MAX_RECORDS as i32).contains(&count) {
+            return Err(Error::protocol(format!(
+                "section block update count {count}"
+            )));
+        }
+        // Section position: x (top 22 bits), z (next 22), y (low 20).
+        let section_x = (section >> 42) as i32;
+        let section_z = ((section << 22) >> 42) as i32;
+        let section_y = ((section << 44) >> 44) as i32;
+        let mut changes = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let record = reader.read_varint()?;
+            if record < 0 {
+                return Err(Error::protocol("negative section block update record"));
+            }
+            let state_id = record >> 12;
+            let local_x = (record >> 8) & 0xF;
+            let local_z = (record >> 4) & 0xF;
+            let local_y = record & 0xF;
+            changes.push(BlockChange {
+                position: BlockPos::new(
+                    section_x * 16 + local_x,
+                    section_y * 16 + local_y,
+                    section_z * 16 + local_z,
+                ),
+                state_id,
+            });
+        }
+        reader.finish()?;
+        Ok(Self { changes })
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let first = self
+            .changes
+            .first()
+            .ok_or_else(|| Error::protocol("empty section blocks update"))?;
+        let section_x = first.position.x.div_euclid(16);
+        let section_y = first.position.y.div_euclid(16);
+        let section_z = first.position.z.div_euclid(16);
+        let count = i32::try_from(self.changes.len())
+            .map_err(|_| Error::protocol("too many section block updates"))?;
+        if count > Self::MAX_RECORDS as i32 {
+            return Err(Error::protocol("too many section block updates"));
+        }
+        let mut writer = Writer::new();
+        writer.write_varint(ids::play::clientbound::SECTION_BLOCKS_UPDATE);
+        let section = ((i64::from(section_x) & 0x3F_FFFF) << 42)
+            | ((i64::from(section_z) & 0x3F_FFFF) << 20)
+            | (i64::from(section_y) & 0xF_FFFF);
+        writer.write_i64(section);
+        writer.write_varint(count);
+        for change in &self.changes {
+            if change.position.x.div_euclid(16) != section_x
+                || change.position.y.div_euclid(16) != section_y
+                || change.position.z.div_euclid(16) != section_z
+            {
+                return Err(Error::protocol(
+                    "section blocks update spans more than one section",
+                ));
+            }
+            if !(0..=Self::MAX_STATE_ID).contains(&change.state_id) {
+                return Err(Error::protocol("block state id out of range"));
+            }
+            let relative = ((change.position.x.rem_euclid(16) as u32) << 8)
+                | ((change.position.z.rem_euclid(16) as u32) << 4)
+                | (change.position.y.rem_euclid(16) as u32);
+            let record = ((change.state_id as u32) << 12) | (relative & 0xFFF);
+            writer.write_varint(record as i32);
+        }
+        Ok(writer.into_inner())
+    }
+}
+
 /// Clientbound `UnloadChunk`.
 ///
 /// The 1.21.1 packet writes Z before X, matching the official packet report.
@@ -2117,5 +2216,97 @@ mod tests {
         assert_eq!(&encoded[1..5], &(-4i32).to_be_bytes());
         assert_eq!(&encoded[5..9], &3i32.to_be_bytes());
         assert_eq!(UnloadChunk::decode(&encoded[1..]).unwrap(), packet);
+    }
+
+    /// A captured 1.21.1 `SectionBlocksUpdate`: three setblocks (stone,
+    /// gold, glass) at y=-50 inside section (3, -4, -4).
+    #[test]
+    fn section_blocks_update_decodes_captured_packet() {
+        let payload = [
+            0x00, 0x00, 0x0f, 0xff, 0xff, 0xcf, 0xff, 0xfc, // section (3, -4, -4)
+            0x03, // count
+            0xee, 0x25, // state 1 at (50, -50, -50)
+            0xee, 0xed, 0x8a, 0x04, // state 2091 at (54, -50, -50)
+            0xee, 0xe9, 0x81, 0x01, // state 519 at (52, -50, -50)
+        ];
+        let packet = SectionBlocksUpdate::decode(&payload).unwrap();
+        let expected = [(50, -50, -50, 1), (54, -50, -50, 2091), (52, -50, -50, 519)];
+        assert_eq!(packet.changes.len(), 3);
+        for (change, (x, y, z, state)) in packet.changes.iter().zip(expected) {
+            assert_eq!(
+                (
+                    change.position.x,
+                    change.position.y,
+                    change.position.z,
+                    change.state_id
+                ),
+                (x, y, z, state)
+            );
+        }
+        // Round-trip through the encoder.
+        assert_eq!(
+            SectionBlocksUpdate::decode(&packet.encode().unwrap()[1..]).unwrap(),
+            packet
+        );
+    }
+
+    /// The second captured packet: glass and stone at z=-60, plus a record
+    /// whose relative z and y differ, proving the 4/4/4-bit field order.
+    #[test]
+    fn section_blocks_update_decodes_second_captured_packet() {
+        let payload = [
+            0x00, 0x00, 0x0f, 0xff, 0xff, 0xcf, 0xff, 0xfc, 0x02, 0xce, 0xfc, 0x81,
+            0x01, // state 519 at (62, -50, -60)
+            0xce, 0x38, // state 1 at (60, -50, -60)
+        ];
+        let packet = SectionBlocksUpdate::decode(&payload).unwrap();
+        assert_eq!(
+            packet
+                .changes
+                .iter()
+                .map(|c| (c.position.x, c.position.y, c.position.z, c.state_id))
+                .collect::<Vec<_>>(),
+            vec![(62, -50, -60, 519), (60, -50, -60, 1)]
+        );
+    }
+
+    #[test]
+    fn section_blocks_update_rejects_bad_records() {
+        let mut payload = vec![0u8; 8]; // section (0, 0, 0)
+        payload.push(1); // count
+        payload.push(0x80); // varint without a terminator
+        assert!(SectionBlocksUpdate::decode(&payload).is_err());
+
+        // Count above one section's capacity.
+        let mut payload = vec![0u8; 8];
+        payload.extend_from_slice(&[0x80, 0x20]); // varint 4097
+        assert!(SectionBlocksUpdate::decode(&payload).is_err());
+
+        // Trailing bytes after the declared records.
+        let mut payload = vec![0u8; 8];
+        payload.extend_from_slice(&[0x00, 0x01, 0x00]);
+        assert!(SectionBlocksUpdate::decode(&payload).is_err());
+    }
+
+    #[test]
+    fn section_blocks_update_encode_rejects_mixed_sections() {
+        let mixed = SectionBlocksUpdate {
+            changes: vec![
+                BlockChange {
+                    position: BlockPos::new(1, 0, 0),
+                    state_id: 1,
+                },
+                BlockChange {
+                    position: BlockPos::new(16, 0, 0),
+                    state_id: 1,
+                },
+            ],
+        };
+        assert!(mixed.encode().is_err());
+        assert!(SectionBlocksUpdate {
+            changes: Vec::new()
+        }
+        .encode()
+        .is_err());
     }
 }

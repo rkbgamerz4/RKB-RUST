@@ -246,6 +246,18 @@ fn run(args: Args) -> Result<(), String> {
                 change.state_id,
                 block_name(registry.as_ref(), change.state_id)
             ),
+            Event::BlocksChanged(changes) => {
+                for change in &changes {
+                    println!(
+                        "block update at ({}, {}, {}): state {}{}",
+                        change.position.x,
+                        change.position.y,
+                        change.position.z,
+                        change.state_id,
+                        block_name(registry.as_ref(), change.state_id)
+                    );
+                }
+            }
             Event::Health(health) => println!(
                 "health: {:.1} food {} saturation {:.1}",
                 health.health, health.food, health.food_saturation

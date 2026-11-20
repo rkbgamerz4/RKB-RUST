@@ -175,6 +175,8 @@ pub mod play {
         pub const ENTITY_DESTROY: i32 = 0x42;
         /// `Respawn`.
         pub const RESPAWN: i32 = 0x47;
+        /// `SectionBlocksUpdate` (multi block change).
+        pub const SECTION_BLOCKS_UPDATE: i32 = 0x49;
         /// `SetHeldItem`.
         pub const HELD_ITEM_SLOT: i32 = 0x53;
         /// `SetExperience`.

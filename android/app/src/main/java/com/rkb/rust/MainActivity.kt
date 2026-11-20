@@ -283,6 +283,14 @@ class MainActivity : Activity() {
         @Volatile
         private var surfaceReady = false
 
+        /** True while the wgpu swapchain owns presentation. */
+        @Volatile
+        private var gpuActive = false
+
+        /** True after a GPU failure; the M6 software path owns presentation. */
+        @Volatile
+        private var gpuUnavailable = false
+
         private var renderThread: Thread? = null
         private var frameBuffer: ByteBuffer? = null
         private var bitmap: Bitmap? = null
@@ -316,12 +324,18 @@ class MainActivity : Activity() {
 
         override fun surfaceCreated(holder: SurfaceHolder) {
             surfaceReady = true
+            // A fresh surface may carry a driver that failed before; retry.
+            gpuUnavailable = false
             if (activityResumed) {
                 startRendering()
             }
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            // Rotation and size changes reach the GPU path through these two
+            // fields; the software path also rebuilds its bitmap from them.
+            surfaceWidth = width
+            surfaceHeight = height
             // Force the render thread to rebuild its bitmap and direct buffer
             // for the new surface geometry.
             synchronized(this) {
@@ -334,7 +348,14 @@ class MainActivity : Activity() {
             surfaceReady = false
             touchQueue.clear()
             lastFrameNanos = 0L
-            if (stopRendering()) {
+            val stopped = stopRendering()
+            if (stopped) {
+                // The render thread is gone, so the swapchain is idle and its
+                // native window can be released before the Surface dies.
+                if (gpuActive && engineHandle != 0L) {
+                    RkbNative.nativeDetachSurface(engineHandle)
+                    gpuActive = false
+                }
                 releaseBuffers()
             }
         }
@@ -385,91 +406,206 @@ class MainActivity : Activity() {
         override fun run() {
             while (running && surfaceReady) {
                 val frameStart = System.nanoTime()
-                val canvas = holder.lockCanvas()
-                if (canvas == null) {
-                    sleepUntilNextFrame(frameStart)
-                    continue
-                }
                 try {
-                    val width = canvas.width
-                    val height = canvas.height
-                    if (width <= 0 || height <= 0) {
-                        sleepUntilNextFrame(frameStart)
-                        continue
+                    // First frame on a fresh surface: try the swapchain once.
+                    // A failure is reported once and the M6 software path takes
+                    // over for as long as this surface lives.
+                    if (!gpuActive && !gpuUnavailable) {
+                        tryAttachGpu()
                     }
-                    ensureBuffers(width, height)
-
-                    if (engineHandle == 0L) {
-                        engineHandle = RkbNative.nativeCreate(
-                            bufferWidth,
-                            bufferHeight,
-                            worldDir.absolutePath,
-                        )
-                        if (engineHandle == 0L) {
-                            Log.e(TAG, "nativeCreate failed")
-                            running = false
-                            break
-                        }
-                    }
-
-                    // Native calls are confined to this render thread. UI-thread
-                    // touch events are queued and delivered here.
-                    drainTouchQueue(engineHandle)
-                    drainJoinQueue(engineHandle)
-
-                    val now = System.nanoTime()
-                    val delta = if (lastFrameNanos == 0L) {
-                        FRAME_NANOS
+                    if (gpuActive) {
+                        renderGpuFrame()
                     } else {
-                        (now - lastFrameNanos).coerceIn(1_000_000L, 250_000_000L)
-                    }
-                    lastFrameNanos = now
-
-                    val buffer = frameBuffer
-                    val target = bitmap
-                    if (buffer != null && target != null) {
-                        if (
-                            RkbNative.nativeRenderFrame(
-                                engineHandle,
-                                buffer,
-                                bufferWidth,
-                                bufferHeight,
-                                delta,
-                            )
-                        ) {
-                            buffer.rewind()
-                            target.copyPixelsFromBuffer(buffer)
-                            canvas.drawBitmap(
-                                target,
-                                null,
-                                Rect(0, 0, width, height),
-                                null,
-                            )
-                            frameCount++
-                            if (frameCount == 1L) {
-                                Log.i(TAG, "first frame presented (${width}x$height)")
-                            }
-                            if (frameCount == 1L || frameCount % 30L == 0L) {
-                                val stats = RkbNative.nativeStats(engineHandle)
-                                if (frameCount == 1L || frameCount % 60L == 0L) {
-                                    Log.i(TAG, stats)
-                                }
-                                updateOverlay(stats)
-                            }
-                        }
+                        renderSoftwareFrame()
                     }
                 } catch (error: Throwable) {
                     Log.e(TAG, "render loop failed", error)
                     running = false
-                } finally {
-                    try {
-                        holder.unlockCanvasAndPost(canvas)
-                    } catch (error: IllegalStateException) {
-                        Log.w(TAG, "surface released before present", error)
+                }
+                sleepUntilNextFrame(frameStart)
+            }
+        }
+
+        /**
+         * Creates the engine if needed and attaches the wgpu swapchain to the
+         * current [android.view.Surface].
+         *
+         * Returns without setting [gpuActive] on failure, after logging the
+         * exact adapter error reported by the native side.
+         */
+        private fun tryAttachGpu() {
+            val width = surfaceWidth
+            val height = surfaceHeight
+            if (width <= 0 || height <= 0) {
+                // `surfaceChanged` has not reported a size yet.
+                return
+            }
+            if (engineHandle == 0L) {
+                engineHandle = RkbNative.nativeCreate(width, height, worldDir.absolutePath)
+                if (engineHandle == 0L) {
+                    Log.e(TAG, "nativeCreate failed")
+                    running = false
+                    return
+                }
+            }
+            val summary = RkbNative.nativeAttachSurface(engineHandle, holder.surface, width, height)
+            if (summary == null) {
+                gpuUnavailable = true
+                val status = RkbNative.nativeGpuStatus(engineHandle)
+                Log.e(TAG, "GPU initialization failed, using the M6 software renderer: $status")
+                updateOverlay(status)
+                return
+            }
+            // The GPU path renders at surface resolution, so touch coordinates
+            // map 1:1 instead of being scaled into the software buffer.
+            bufferWidth = width
+            bufferHeight = height
+            lastFrameNanos = 0L
+            gpuActive = true
+            Log.i(TAG, "GPU renderer attached: $summary")
+        }
+
+        /** Presents one frame through the wgpu swapchain. */
+        private fun renderGpuFrame() {
+            if (engineHandle == 0L) {
+                return
+            }
+            val width = surfaceWidth
+            val height = surfaceHeight
+            if (width <= 0 || height <= 0) {
+                return
+            }
+            // `surfaceChanged` zeroes the software buffer size on rotation;
+            // the GPU path always renders at surface resolution.
+            bufferWidth = width
+            bufferHeight = height
+            // Native calls are confined to this render thread. UI-thread touch
+            // events are queued and delivered here.
+            drainTouchQueue(engineHandle)
+            drainJoinQueue(engineHandle)
+            val delta = frameDelta()
+            when (RkbNative.nativeRenderFrameGpu(engineHandle, width, height, delta)) {
+                GPU_FRAME_PRESENTED -> {
+                    frameCount++
+                    if (frameCount == 1L) {
+                        Log.i(TAG, "first GPU frame presented (${width}x$height)")
+                    }
+                    publishStats()
+                }
+                GPU_FRAME_SKIPPED -> Unit
+                else -> fallBackToSoftware("GPU frame failed")
+            }
+        }
+
+        /**
+         * Presents one frame through the M6 software rasterizer into a bitmap.
+         *
+         * This is the reference implementation and the fallback whenever the
+         * GPU path cannot initialize or fails mid-session.
+         */
+        private fun renderSoftwareFrame() {
+            val canvas = holder.lockCanvas() ?: return
+            try {
+                val width = canvas.width
+                val height = canvas.height
+                if (width <= 0 || height <= 0) {
+                    return
+                }
+                ensureBuffers(width, height)
+
+                if (engineHandle == 0L) {
+                    engineHandle = RkbNative.nativeCreate(
+                        bufferWidth,
+                        bufferHeight,
+                        worldDir.absolutePath,
+                    )
+                    if (engineHandle == 0L) {
+                        Log.e(TAG, "nativeCreate failed")
+                        running = false
+                        return
                     }
                 }
 
-                sleepUntilNextFrame(frameStart)
+                // Native calls are confined to this render thread. UI-thread
+                // touch events are queued and delivered here.
+                drainTouchQueue(engineHandle)
+                drainJoinQueue(engineHandle)
+
+                val delta = frameDelta()
+                val buffer = frameBuffer
+                val target = bitmap
+                if (buffer != null && target != null) {
+                    if (
+                        RkbNative.nativeRenderFrame(
+                            engineHandle,
+                            buffer,
+                            bufferWidth,
+                            bufferHeight,
+                            delta,
+                        )
+                    ) {
+                        buffer.rewind()
+                        target.copyPixelsFromBuffer(buffer)
+                        canvas.drawBitmap(
+                            target,
+                            null,
+                            Rect(0, 0, width, height),
+                            null,
+                        )
+                        frameCount++
+                        if (frameCount == 1L) {
+                            Log.i(TAG, "first frame presented (${width}x$height)")
+                        }
+                        publishStats()
+                    }
+                }
+            } finally {
+                try {
+                    holder.unlockCanvasAndPost(canvas)
+                } catch (error: IllegalStateException) {
+                    Log.w(TAG, "surface released before present", error)
+                }
+            }
+        }
+
+        /**
+         * Detaches the swapchain after a GPU failure and lets the software
+         * path resume with a rebuilt bitmap buffer.
+         */
+        private fun fallBackToSoftware(reason: String) {
+            val status = RkbNative.nativeGpuStatus(engineHandle)
+            Log.e(TAG, "$reason, using the M6 software renderer: $status")
+            RkbNative.nativeDetachSurface(engineHandle)
+            gpuActive = false
+            gpuUnavailable = true
+            lastFrameNanos = 0L
+            synchronized(this) {
+                bufferWidth = 0
+                bufferHeight = 0
+            }
+            updateOverlay(status)
+        }
+
+        /** Frame delta, clamped so a stall cannot advance the simulation far. */
+        private fun frameDelta(): Long {
+            val now = System.nanoTime()
+            val delta = if (lastFrameNanos == 0L) {
+                FRAME_NANOS
+            } else {
+                (now - lastFrameNanos).coerceIn(1_000_000L, 250_000_000L)
+            }
+            lastFrameNanos = now
+            return delta
+        }
+
+        /** Logs and publishes counters on the first frame and every 30th. */
+        private fun publishStats() {
+            if (frameCount == 1L || frameCount % 30L == 0L) {
+                val stats = RkbNative.nativeStats(engineHandle)
+                if (frameCount == 1L || frameCount % 60L == 0L) {
+                    Log.i(TAG, stats)
+                }
+                updateOverlay(stats)
             }
         }
 
@@ -642,5 +778,9 @@ class MainActivity : Activity() {
         const val FRAME_NANOS = 16_666_667L
         const val MAX_QUEUED_TOUCHES = 512
         const val RENDER_SCALE = 0.6f
+
+        /** Native `nativeRenderFrameGpu` outcomes. */
+        const val GPU_FRAME_PRESENTED = 0
+        const val GPU_FRAME_SKIPPED = 1
     }
 }

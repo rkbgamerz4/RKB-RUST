@@ -171,6 +171,17 @@ impl ServerWorld {
                         state,
                     });
                 }
+                Event::BlocksChanged(changes) => {
+                    for change in changes {
+                        let state = block_state(&registry, change.state_id)?;
+                        buffered.push(Update::Block {
+                            x: change.position.x,
+                            y: change.position.y,
+                            z: change.position.z,
+                            state,
+                        });
+                    }
+                }
                 Event::ChunkUnloaded { x, z } => buffered.push(Update::Unload { x, z }),
                 Event::Position(_) => {
                     let player = session.player();
@@ -463,6 +474,24 @@ fn reader_loop(
                 },
                 Err(error) => Update::Error(format!("block update rejected: {error}")),
             },
+            Ok(Event::BlocksChanged(changes)) => {
+                for change in changes {
+                    let update = match block_state(&registry, change.state_id) {
+                        Ok(state) => Update::Block {
+                            x: change.position.x,
+                            y: change.position.y,
+                            z: change.position.z,
+                            state,
+                        },
+                        Err(error) => Update::Error(format!("block update rejected: {error}")),
+                    };
+                    if sender.send(update).is_err() {
+                        return;
+                    }
+                }
+                // Every record of the batch has been forwarded individually.
+                continue;
+            }
             Ok(Event::ChunkUnloaded { x, z }) => Update::Unload { x, z },
             Ok(Event::Respawned(_)) => Update::Reset,
             Ok(Event::Position(_)) => {

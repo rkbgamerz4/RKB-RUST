@@ -3,7 +3,7 @@ name: Android emulator startup
 on:
   workflow_dispatch:
   push:
-    branches: [feature/rkb-rust-foundation]
+    branches: [feature/rkb-rust-foundation, feature/mc-java-protocol]
 
 permissions:
   contents: read

@@ -144,10 +144,17 @@ fn kotlin_type(jni: &str) -> &'static str {
         "jboolean" => "Boolean",
         "f32" => "Float",
         "JByteBuffer" => "java.nio.ByteBuffer",
+        "JObject" => "android.view.Surface",
         "jstring" => "String",
         "()" => "Unit",
         other => panic!("unmapped JNI type '{other}'"),
     }
+}
+
+/// Kotlin may mark a reference type nullable (`String?`); the JNI signature is
+/// identical, so nullability is not part of the contract.
+fn nullable_free(value: &str) -> &str {
+    value.trim().trim_end_matches('?')
 }
 
 #[test]
@@ -182,7 +189,11 @@ fn kotlin_declarations_match_jni_exports() {
             .iter()
             .map(|kind| kotlin_type(kind))
             .collect();
-        let expected: Vec<&str> = declaration.params.iter().map(String::as_str).collect();
+        let expected: Vec<&str> = declaration
+            .params
+            .iter()
+            .map(|param| nullable_free(param))
+            .collect();
         assert_eq!(
             mapped, expected,
             "parameter mismatch for native{}",
@@ -190,7 +201,7 @@ fn kotlin_declarations_match_jni_exports() {
         );
         assert_eq!(
             kotlin_type(&export.returns),
-            declaration.returns,
+            nullable_free(&declaration.returns),
             "return type mismatch for native{}",
             declaration.name
         );

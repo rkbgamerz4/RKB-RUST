@@ -109,7 +109,9 @@ assert_common_log() {
         || fail "${logfile}: native library never initialized"
     grep -q 'native engine created' "${logfile}" \
         || fail "${logfile}: native engine was never created"
-    grep -q 'first frame presented' "${logfile}" \
+    # M7: the GPU path logs "first GPU frame presented", the M6 software path
+    # logs "first frame presented". Either is a presented frame.
+    grep -qE 'first (GPU )?frame presented' "${logfile}" \
         || fail "${logfile}: no frame was presented"
 
     local stats loaded generated faces tris
@@ -133,6 +135,38 @@ assert_common_log() {
     if grep -q 'balls=' "${logfile}"; then
         fail "${logfile}: the old sandbox is still running"
     fi
+}
+
+# M7: every stats line ends with the active backend, reported honestly:
+#
+#   renderer=gpu wgpu / Vulkan / <adapter>      (wgpu swapchain presents)
+#   renderer=software (<exact GPU error>)       (M6 software fallback)
+#
+# The emulator's GPU (swiftshader) may or may not initialize wgpu; both
+# outcomes are valid, but the log must name which one happened and, on
+# fallback, carry the exact GPU error.
+assert_backend_line() {
+    local logfile="$1"
+    local backend
+    backend="$(grep -oE 'renderer=(gpu|software) \(?[^|]*' "${logfile}" | tail -n1)"
+    [ -n "${backend}" ] || fail "${logfile}: no renderer= backend line was logged"
+    case "${backend}" in
+        renderer=gpu*)
+            grep -q 'GPU renderer attached' "${logfile}" \
+                || fail "${logfile}: renderer=gpu without the attach line"
+            grep -q 'first GPU frame presented' "${logfile}" \
+                || fail "${logfile}: renderer=gpu but no GPU frame was presented"
+            log "backend (${logfile##*/}): ${backend}"
+            ;;
+        renderer=software*)
+            grep -q 'using the M6 software renderer' "${logfile}" \
+                || fail "${logfile}: renderer=software without an exact GPU error"
+            log "backend (${logfile##*/}): ${backend} (software fallback)"
+            ;;
+        *)
+            fail "${logfile}: unrecognized backend line: ${backend}"
+            ;;
+    esac
 }
 
 # The host prefers the app's external files dir and falls back to private
@@ -185,6 +219,7 @@ adb logcat -d > "${OUT}/emulator-logcat-generated.txt"
 assert_process_alive "-generated"
 GENERATED_LOG="${OUT}/emulator-logcat-generated.txt"
 assert_common_log "${GENERATED_LOG}"
+assert_backend_line "${GENERATED_LOG}"
 grep -q 'kind=generated' "${GENERATED_LOG}" \
     || fail "fresh install did not start a generated world"
 grep -q 'Generated world seed' "${GENERATED_LOG}" \
@@ -234,6 +269,7 @@ adb logcat -d > "${OUT}/emulator-logcat.txt"
 assert_process_alive ""
 SAVE_LOG="${OUT}/emulator-logcat.txt"
 assert_common_log "${SAVE_LOG}"
+assert_backend_line "${SAVE_LOG}"
 grep -q 'kind=save' "${SAVE_LOG}" \
     || fail "supplied save was not opened as a save world"
 grep -q 'RKB Demo Island' "${SAVE_LOG}" \
@@ -251,9 +287,9 @@ if grep -qE 'ANR in com\.rkb\.rust|am_anr.*com\.rkb\.rust' "${GENERATED_LOG}" "$
 fi
 
 log "startup summary (generated)"
-grep -E 'RKB RUST native version|native engine created|first frame presented|minecraft client:|world=loaded kind=' \
+grep -E 'RKB RUST native version|native engine created|first (GPU )?frame presented|GPU renderer attached|renderer=(gpu|software)|minecraft client:|world=loaded kind=' \
     "${GENERATED_LOG}" || true
 log "startup summary (save)"
-grep -E 'RKB RUST native version|native engine created|first frame presented|minecraft client:|world=loaded kind=' \
+grep -E 'RKB RUST native version|native engine created|first (GPU )?frame presented|GPU renderer attached|renderer=(gpu|software)|minecraft client:|world=loaded kind=' \
     "${SAVE_LOG}" || true
-log "PASS: ${PKG} generated terrain on a fresh install, loaded a supplied 1.21 save, rendered block geometry, and logged no crash"
+log "PASS: ${PKG} generated terrain on a fresh install, loaded a supplied 1.21 save, rendered block geometry, named its renderer backend, and logged no crash"

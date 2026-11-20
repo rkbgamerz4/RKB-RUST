@@ -31,8 +31,9 @@ use rkb_proto::packets::play::{
     BlockChange, BlockPos, ChunkBatchFinished, ChunkBatchReceived, ChunkColumn, ChunkData,
     ConfigurationAcknowledged, EntityDestroy, EntityLook, EntityMoveLook, EntityTeleport,
     Experience, GameStateChange, HeldItem, JoinGame, KeepAlive, KickDisconnect, Ping, Pong,
-    RelativeEntityMove, Respawn, SetSlot, Slot, SpawnEntity, SyncPlayerPosition, SystemChat,
-    TeleportConfirm, UnloadChunk, UpdateHealth, UpdateLight, UpdateTime, WindowItems,
+    RelativeEntityMove, Respawn, SectionBlocksUpdate, SetSlot, Slot, SpawnEntity,
+    SyncPlayerPosition, SystemChat, TeleportConfirm, UnloadChunk, UpdateHealth, UpdateLight,
+    UpdateTime, WindowItems,
 };
 use rkb_proto::packets::RegistryData;
 
@@ -171,6 +172,9 @@ pub enum Event {
     ChunkUnloaded { x: i32, z: i32 },
     /// A single block changed.
     BlockChanged(BlockChange),
+    /// Several blocks changed inside one section (`SectionBlocksUpdate`);
+    /// the server batches live edits this way.
+    BlocksChanged(Vec<BlockChange>),
     /// A light-only update arrived.
     LightUpdated {
         chunk_x: i32,
@@ -441,6 +445,15 @@ impl<S: Read + Write> PlaySession<S> {
                     .insert(packet.position, packet.state_id as u32);
                 self.stats.block_updates += 1;
                 Ok(Event::BlockChanged(packet))
+            }
+            clientbound::SECTION_BLOCKS_UPDATE => {
+                let packet = SectionBlocksUpdate::decode(payload)?;
+                for change in &packet.changes {
+                    self.block_updates
+                        .insert(change.position, change.state_id as u32);
+                }
+                self.stats.block_updates += packet.changes.len() as u64;
+                Ok(Event::BlocksChanged(packet.changes))
             }
             clientbound::UNLOAD_CHUNK => {
                 let packet = UnloadChunk::decode(payload)?;
@@ -1145,6 +1158,45 @@ mod tests {
         assert_eq!(session.next_event().unwrap(), Event::BlockChanged(change));
         assert_eq!(session.block_state(1, -63, 2), Some(5));
         assert_eq!(session.block_updates().len(), 1);
+    }
+
+    #[test]
+    fn section_blocks_update_applies_every_record() {
+        // A live edit batch captured from a 1.21.1 server: three records in
+        // section (3, -4, -4).
+        let payload = [
+            0x00, 0x00, 0x0f, 0xff, 0xff, 0xcf, 0xff, 0xfc, 0x03, 0xee, 0x25, 0xee, 0xed, 0x8a,
+            0x04, 0xee, 0xe9, 0x81, 0x01,
+        ];
+        let body = {
+            let mut writer = Writer::new();
+            writer.write_varint(ids::play::clientbound::SECTION_BLOCKS_UPDATE);
+            writer.write_bytes(&payload);
+            writer.into_inner()
+        };
+        let (mut session, _pipe) = session(&[
+            join_game().encode().unwrap(),
+            chunk_packet().encode().unwrap(),
+            body,
+        ]);
+        session.next_event().unwrap(); // joined
+        session.next_event().unwrap(); // chunk
+        match session.next_event().unwrap() {
+            Event::BlocksChanged(changes) => {
+                let positions: Vec<(i32, i32, i32, i32)> = changes
+                    .iter()
+                    .map(|c| (c.position.x, c.position.y, c.position.z, c.state_id))
+                    .collect();
+                assert_eq!(
+                    positions,
+                    vec![(50, -50, -50, 1), (54, -50, -50, 2091), (52, -50, -50, 519)]
+                );
+            }
+            other => panic!("expected BlocksChanged, got {other:?}"),
+        }
+        // Every record lands in the session's override map and the counter.
+        assert_eq!(session.block_updates().len(), 3);
+        assert_eq!(session.stats().block_updates, 3);
     }
 
     #[test]

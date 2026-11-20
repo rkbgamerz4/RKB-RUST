@@ -60,4 +60,38 @@ object RkbNative {
     external fun nativeResume(handle: Long): Boolean
     external fun nativeStats(handle: Long): String
     external fun nativeVersion(): String
+
+    /**
+     * Attaches the GPU swapchain to [surface] and initializes wgpu.
+     *
+     * Returns the adapter summary (`wgpu / Vulkan / <name> hardware GPU` or
+     * `… software renderer`) on success and `null` on failure, in which case
+     * [nativeGpuStatus] reports the exact error and the caller must fall back
+     * to the M6 software bitmap path.
+     */
+    external fun nativeAttachSurface(
+        handle: Long,
+        surface: android.view.Surface,
+        width: Int,
+        height: Int,
+    ): String?
+
+    /** Drops the swapchain and releases the native window reference. */
+    external fun nativeDetachSurface(handle: Long): Boolean
+
+    /**
+     * Renders one frame into the attached swapchain.
+     *
+     * 0 = presented, 1 = skipped (paused or no update), 2 = failed; on failure
+     * the caller falls back to the software renderer.
+     */
+    external fun nativeRenderFrameGpu(
+        handle: Long,
+        width: Int,
+        height: Int,
+        deltaNanos: Long,
+    ): Int
+
+    /** Active backend line, including the exact GPU error when one occurred. */
+    external fun nativeGpuStatus(handle: Long): String
 }
